@@ -9,6 +9,12 @@
 //! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
 
+/// 最大支持的系统调用数量
+pub const MAX_SYSCALL_NUM: usize = 411;
+
+
+
+
 mod context;
 mod switch;
 #[allow(clippy::module_inception)]
@@ -54,6 +60,10 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+
+            syscall_times: [0; MAX_SYSCALL_NUM],  // 一行
+
+
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -77,6 +87,10 @@ impl TaskManager {
     /// Generally, the first task in task list is an idle task (we call it zero process later).
     /// But in ch3, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
+
+
+        
+
         let mut inner = self.inner.exclusive_access();
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
@@ -168,4 +182,26 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+
+/// 系统调用次数 +1
+pub fn inc_syscall(syscall_id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].syscall_times[syscall_id] += 1;
+}
+
+/// 获取当前进程的系统调用次数
+/// 获取当前进程的系统调用次数
+pub fn get_current_syscall_times(syscall_id: usize) -> u32 {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    // 新增：边界判断，防止非法ID导致内核崩溃
+    if syscall_id < MAX_SYSCALL_NUM {
+        inner.tasks[current].syscall_times[syscall_id]
+    } else {
+        // 非法ID直接返回0
+        0
+    }
 }
