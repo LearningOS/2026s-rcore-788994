@@ -202,3 +202,39 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
 }
+
+///
+pub fn inc_syscall(syscall_id: usize) {
+    if syscall_id < crate::task::task::MAX_SYSCALL_NUM {
+        // 根据你第四章的具体实现，可能是 current_task().unwrap().inner_exclusive_access() 
+        // 这里的代码取决于你 task 管理器的结构，最常见的是下面这种：
+        let mut inner = TASK_MANAGER.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+}
+///
+pub fn get_current_syscall_times(syscall_id: usize) -> u32 {
+    if syscall_id < crate::task::task::MAX_SYSCALL_NUM {
+        let inner = TASK_MANAGER.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id]
+    } else {
+        0
+    }
+}
+
+/// 处理当前任务的 mmap 映射
+pub fn mmap_current(start: usize, len: usize, port: usize) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.mmap(start, len, port)
+}
+
+/// 处理当前任务的 munmap 解除映射
+pub fn munmap_current(start: usize, len: usize) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.munmap(start, len)
+}
+

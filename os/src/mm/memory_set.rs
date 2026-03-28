@@ -262,7 +262,89 @@ impl MemorySet {
             false
         }
     }
+
+ 
+    /// 处理 mmap 映射请求
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        // 1. 检查起始地址必须按页对齐 (PAGE_SIZE = 4096)
+        if start % PAGE_SIZE != 0 {
+            return -1;
+        }
+        
+        // 2. 检查权限 (必须包含读/写/执行中至少一种，且不能带有其他非法位)
+        if port & !0x7 != 0 || port & 0x7 == 0 {
+            return -1;
+        }
+
+        // 3. 检查映射长度，防止数值溢出
+        if len == 0 {
+            return -1;
+        }
+        let end = start.wrapping_add(len);
+        if end < start {
+            return -1; // 地址溢出
+        }
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(end);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        // 4. 冲突检查：要映射的区间绝不能与已有的任何区间重叠
+        for area in self.areas.iter() {
+            if area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn {
+                return -1; // 发现地址重叠，直接拒绝！
+            }
+        }
+
+        // 5. 安检全部通过，开始真正分配
+        let mut map_perm = MapPermission::U;
+        if port & 1 != 0 { map_perm |= MapPermission::R; }
+        if port & 2 != 0 { map_perm |= MapPermission::W; }
+        if port & 4 != 0 { map_perm |= MapPermission::X; }
+
+        self.insert_framed_area(start_va, end_va, map_perm);
+        0
+    }
+
+    /// 处理 munmap 解除映射请求
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        // 1. 基本安全检查
+        if start % PAGE_SIZE != 0 { return -1; }
+        if len == 0 { return -1; }
+        let end = start.wrapping_add(len);
+        if end < start { return -1; }
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(end);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        // 2. 寻找完全包含目标区间的 MapArea
+        let mut found_idx = None;
+        for (idx, area) in self.areas.iter().enumerate() {
+            if area.vpn_range.get_start() <= start_vpn && area.vpn_range.get_end() >= end_vpn {
+                found_idx = Some(idx);
+                break;
+            }
+        }
+
+        if let Some(idx) = found_idx {
+            // 3. 解除映射的范围必须与申请时完全一致
+            if self.areas[idx].vpn_range.get_start() == start_vpn && self.areas[idx].vpn_range.get_end() == end_vpn {
+                let mut area = self.areas.remove(idx);
+                area.unmap(&mut self.page_table); // 清除物理页和页表条目
+                return 0;
+            }
+        }
+        
+        // 找不到对应区间或者部分解除，直接返回错误
+        -1
+    }
+ 
 }
+
+
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
     vpn_range: VPNRange,
