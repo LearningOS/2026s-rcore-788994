@@ -1,8 +1,17 @@
 //! Process management syscalls
 use alloc::sync::Arc;
 
+
+use crate::timer::get_time_us;
+use crate::mm::{MapPermission, MemorySet, KERNEL_SPACE};
+use crate::trap::{TrapContext, trap_handler};
+
+use crate::config::PAGE_SIZE;
+use crate::mm::{VirtAddr, VirtPageNum};
+
+
 use crate::{
-    loader::get_app_data_by_name,
+   // loader::get_app_data_by_name,
     mm::{translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
@@ -105,31 +114,82 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let  v = translated_refmut(current_user_token(), ts);
+    v.usec = us % 1_000_000;
+    v.sec = us / 1_000_000;
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
-}
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    // 检查 port (只允许第 0, 1, 2 位被设置)
+    if port & !0x7 != 0 || port == 0 {
+        return -1;
+    }
+    // 检查按页对齐
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start + len);
+    let start_vpn = start_va.floor();
+    let end_vpn = end_va.ceil();
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    
+    // 【关键修复】不仅要能找到 PTE，还必须确认它的 Valid 位是 1 才算被占用！
+    for vpn_val in start_vpn.0..end_vpn.0 {
+        let vpn = VirtPageNum(vpn_val);
+        if let Some(pte) = inner.memory_set.translate(vpn) {
+            if pte.is_valid() {
+                return -1; // 存在真实有效的重叠映射，返回 -1
+            }
+        }
+    }
+    
+    let permission = MapPermission::from_bits((port as u8) << 1).unwrap() | MapPermission::U;
+    inner.memory_set.insert_framed_area(start_va, end_va, permission);
+    0 // 成功返回 0
 }
+///
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    // 检查 start 是否按页对齐
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(start + len);
+    let start_vpn = start_va.floor();
+    let end_vpn = end_va.ceil();
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    
+    // 调用刚才新增的严格匹配起止范围的方法，如果长度不对必定返回 false
+    let removed = inner.memory_set.remove_area_with_start_and_end_vpn(start_vpn, end_vpn);
+    
+    if removed {
+        0
+    } else {
+        -1
+    }
+}
+// pub fn sys_munmap(start: usize, len: usize) -> isize {
+//     trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+//     let task = current_task().unwrap();
+//     if task.munmap(start, len) {
+//         0 // 成功
+//     } else {
+//         -1 // 失败
+//     }
+// }
 
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
@@ -143,19 +203,63 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
-}
+use crate::loader::get_app_data_by_name;
 
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let task = current_task().unwrap();
+        let new_task = task.fork(); // 复制出子进程
+        
+        let (new_user_space, new_user_sp, new_entry) = MemorySet::from_elf(data);
+        let mut new_inner = new_task.inner_exclusive_access();
+        new_inner.memory_set = new_user_space;
+        
+        // 【关键修复 1】必须更新子进程的 trap_cx_ppn，否则会写到旧地址空间的物理页引发 Page Fault！
+        new_inner.trap_cx_ppn = new_inner.memory_set
+            .translate(crate::mm::VirtAddr::from(crate::config::TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        
+        let new_trap_cx = new_inner.get_trap_cx();
+        *new_trap_cx = TrapContext::app_init_context(
+            new_entry, 
+            new_user_sp, 
+            KERNEL_SPACE.exclusive_access().token(),
+            new_task.kernel_stack.get_top(),
+            trap_handler as usize
+        );
+        drop(new_inner);
+        
+        let new_pid = new_task.pid.0; // 获取新 PID
+        add_task(new_task);
+        
+        new_pid as isize // 【关键修复 2】必须返回子进程的 PID
+    } else {
+        -1
+    }
+}
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+// pub fn sys_set_priority(prio: isize) -> isize {
+//     trace!("kernel:pid[{}] sys_set_priority", current_task().unwrap().pid.0);
+     
+//     let task = current_task().unwrap();
+//     let mut inner = task.inner_exclusive_access();
+//     inner.priority = prio; // 确保 TaskControlBlockInner 里有 priority 字段
+//     prio
+// }
+
+///
+pub fn sys_set_priority(prio: isize) -> isize {
+    trace!("kernel:pid[{}] sys_set_priority", current_task().unwrap().pid.0);
+    // 非法优先级直接拒绝
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.priority = prio;
+    prio
 }

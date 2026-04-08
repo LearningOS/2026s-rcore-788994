@@ -22,9 +22,33 @@ impl TaskManager {
         self.ready_queue.push_back(task);
     }
     /// Take a process out of the ready queue
+    /// 
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let mut min_pass = isize::MAX;
+        let mut min_idx = None;
+        for (idx, task) in self.ready_queue.iter().enumerate() {
+            let pass = task.inner_exclusive_access().pass;
+            if pass < min_pass {
+                min_pass = pass;
+                min_idx = Some(idx);
+            }
+        }
+        if let Some(idx) = min_idx {
+            let task = self.ready_queue.remove(idx).unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let big_stride = 10000;
+            // 为防止意外计算时除0，保底取至少为 2
+            let priority = if inner.priority < 2 { 2 } else { inner.priority };
+            inner.pass += big_stride / priority;
+            drop(inner);
+            Some(task)
+        } else {
+            None
+        }
     }
+    // pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+    //     self.ready_queue.pop_front()
+    // }
 }
 
 lazy_static! {

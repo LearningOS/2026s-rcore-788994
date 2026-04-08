@@ -9,6 +9,10 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+
+
+
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -34,6 +38,37 @@ impl TaskControlBlock {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
+
+
+//     pub fn mmap(&self, start: usize, len: usize, port: MapPermission) -> usize {
+//         // 要求 start 必须按页对齐
+//         if start % PAGE_SIZE != 0 {
+//             return 0;
+//         }
+//         let start_va = VirtAddr::from(start);
+//         let end_va = VirtAddr::from(start + len);
+        
+//         // 用户态映射必须加上 User (U) 权限
+//         let permission = port | MapPermission::U;
+        
+//         let mut inner = self.inner_exclusive_access();
+//         // 自动分配物理页并完成映射
+//         inner.memory_set.insert_framed_area(start_va, end_va, permission);
+//         start
+//     }
+// ///
+//     pub fn munmap(&self, start: usize, _len: usize) -> bool {
+//         if start % PAGE_SIZE != 0 {
+//             return false;
+//         }
+//         let start_vpn = VirtAddr::from(start).into();
+        
+//         let mut inner = self.inner_exclusive_access();
+//         // 自动解除映射并回收物理页
+//         inner.memory_set.remove_area_with_start_vpn(start_vpn);
+//         true
+//     }
+
 }
 
 pub struct TaskControlBlockInner {
@@ -68,6 +103,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    pub priority: isize,
+
+    pub pass: isize,   // <-- 加上这一行
+
+
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +159,13 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+
+
+                    priority: 16, // <-- 新增这一行
+                    pass: 0,       // <-- 加上这一行
+
+
+
                 })
             },
         };
@@ -191,6 +239,13 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+
+
+                    priority: parent_inner.priority, // <-- 新增这一行
+                    pass: 0,       // <-- 加上这一行
+
+
+
                 })
             },
         });

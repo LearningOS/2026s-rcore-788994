@@ -32,8 +32,10 @@ lazy_static! {
 }
 /// address space
 pub struct MemorySet {
-    page_table: PageTable,
-    areas: Vec<MapArea>,
+    ///
+    pub page_table: PageTable,
+    ///
+    pub areas: Vec<MapArea>,
 }
 
 impl MemorySet {
@@ -61,17 +63,38 @@ impl MemorySet {
         );
     }
     /// remove a area
-    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
-        if let Some((idx, area)) = self
-            .areas
-            .iter_mut()
-            .enumerate()
-            .find(|(_, area)| area.vpn_range.get_start() == start_vpn)
-        {
-            area.unmap(&mut self.page_table);
-            self.areas.remove(idx);
-        }
+/// remove a area and return true if successfully removed, otherwise false
+pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) -> bool {
+    if let Some((idx, area)) = self
+        .areas
+        .iter_mut()
+        .enumerate()
+        .find(|(_, area)| area.vpn_range.get_start() == start_vpn)
+    {
+        area.unmap(&mut self.page_table);
+        self.areas.remove(idx);
+        true // 找到并删除了，返回 true
+    } else {
+        false // 没找到，返回 false
     }
+}
+
+///
+pub fn remove_area_with_start_and_end_vpn(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+    if let Some((idx, area)) = self
+        .areas
+        .iter_mut()
+        .enumerate()
+        .find(|(_, area)| area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn)
+    {
+        area.unmap(&mut self.page_table);
+        self.areas.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
