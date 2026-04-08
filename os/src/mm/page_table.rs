@@ -158,24 +158,64 @@ impl PageTable {
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
+// pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+//     let page_table = PageTable::from_token(token);
+//     let mut start = ptr as usize;
+//     let end = start + len;
+//     let mut v = Vec::new();
+//     while start < end {
+//         let start_va = VirtAddr::from(start);
+//         let mut vpn = start_va.floor();
+//         let ppn = page_table.translate(vpn).unwrap().ppn();
+//         vpn.step();
+//         let mut end_va: VirtAddr = vpn.into();
+//         end_va = end_va.min(VirtAddr::from(end));
+//         if end_va.page_offset() == 0 {
+//             v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+//         } else {
+//             v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+//         }
+//         start = end_va.into();
+//     }
+//     v
+// }
+
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
-    let end = start + len;
+    // 🛡️ 防御1：防止测试传入恶意极大 len 导致溢出崩溃
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Vec::new();
+    }
+
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
+        
+        // 🛡️ 防御2：拦截非法地址，防止 .unwrap() 直接引发 Panic
+        let pte = page_table.translate(vpn);
+        if pte.is_none() || !pte.unwrap().is_valid() {
+            return Vec::new(); 
+        }
+        let ppn = pte.unwrap().ppn();
+
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
+        
+        // 🛡️ 防御3：彻底斩断 16MB OOM 的核心元凶（防止 39 位截断导致 start 停滞）
+        if end_va.0 <= start {
+            break;
+        }
+
         if end_va.page_offset() == 0 {
             v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
         } else {
             v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
         }
-        start = end_va.into();
+        start = end_va.0; // 必须使用 .0 直接推进，避开 VirtAddr 转换
     }
     v
 }

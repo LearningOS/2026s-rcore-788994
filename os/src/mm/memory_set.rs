@@ -265,28 +265,24 @@ impl MemorySet {
 
  
     /// 处理 mmap 映射请求
-    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+   pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
     if start % PAGE_SIZE != 0 { return -1; }
     if port & !0x7 != 0 || port & 0x7 == 0 { return -1; }
     if len == 0 { return -1; }
     
-    // 🛡️ 防御 1：拒绝超大内存申请，防止耗尽物理内存 (限制为最大 256MB)
-    if len > 0x1000_0000 { return -1; }
-    
-    // 🛡️ 防御 2：限制 MapArea 的数量，防止 Vec 扩容导致 16MB 内核堆爆炸
+    // 🛡️ 关键防御：限制 MapArea 的数量，防止恶意测试无限 mmap 导致内核堆崩溃
     if self.areas.len() >= 256 { return -1; }
 
     let end = start.wrapping_add(len);
     if end < start { return -1; }
 
-    let start_va = VirtAddr::from(start);
-    let end_va = VirtAddr::from(end);
-    let start_vpn = start_va.floor();
-    let end_vpn = end_va.ceil();
+    let start_vpn = VirtAddr::from(start).floor();
+    let end_vpn = VirtAddr::from(end).ceil();
 
+    // 冲突检查：要映射的区间绝不能与已有的任何区间重叠
     for area in self.areas.iter() {
         if area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn {
-            return -1; // 地址重叠，拒绝
+            return -1; 
         }
     }
 
@@ -295,34 +291,73 @@ impl MemorySet {
     if port & 2 != 0 { map_perm |= MapPermission::W; }
     if port & 4 != 0 { map_perm |= MapPermission::X; }
 
-    self.insert_framed_area(start_va, end_va, map_perm);
+    self.insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), map_perm);
     0
 }
 
-/// 处理 munmap 解除映射请求 (支持区间内部解绑版)
+/// 处理 munmap 解除映射请求 (支持区间切片、部分解绑版)
 pub fn munmap(&mut self, start: usize, len: usize) -> isize {
     if start % PAGE_SIZE != 0 { return -1; }
     if len == 0 { return -1; }
     let end = start.wrapping_add(len);
     if end < start { return -1; }
 
-    let start_va = VirtAddr::from(start);
-    let end_va = VirtAddr::from(end);
-    let start_vpn = start_va.floor();
-    let end_vpn = end_va.ceil();
+    let start_vpn = VirtAddr::from(start).floor();
+    let end_vpn = VirtAddr::from(end).ceil();
 
-    // 寻找包含该解绑区间的 MapArea
-    for area in self.areas.iter_mut() {
+    let mut found_idx = None;
+    for (idx, area) in self.areas.iter().enumerate() {
         if area.vpn_range.get_start() <= start_vpn && area.vpn_range.get_end() >= end_vpn {
-            // 找到了！逐页解除物理映射并释放物理页
-            // (为通过测试，这里采用简单释放页表项的策略，暂不处理 VPNRange 的分裂)
-            for vpn in VPNRange::new(start_vpn, end_vpn) {
-                area.unmap_one(&mut self.page_table, vpn);
-            }
-            return 0;
+            found_idx = Some(idx);
+            break;
         }
     }
-    
+
+    if let Some(idx) = found_idx {
+        // 1. 解除这部分的物理内存映射
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            self.areas[idx].unmap_one(&mut self.page_table, vpn);
+        }
+
+        let old_start = self.areas[idx].vpn_range.get_start();
+        let old_end = self.areas[idx].vpn_range.get_end();
+        let map_type = self.areas[idx].map_type;
+        let map_perm = self.areas[idx].map_perm;
+
+        // 2. 如果是完全解绑，直接删掉整个 Area
+        if old_start == start_vpn && old_end == end_vpn {
+            self.areas.remove(idx);
+            return 0;
+        }
+
+        // 3. 如果解绑的是中间部分或前部分，我们需要进行“切片”处理
+        // 处理右半部分：如果解绑区域不到末尾，右边剩下的要单独成块
+        if end_vpn < old_end {
+            let mut right_area = MapArea {
+                vpn_range: VPNRange::new(end_vpn, old_end),
+                data_frames: alloc::collections::BTreeMap::new(),
+                map_type,
+                map_perm,
+            };
+            // 把右半部分的物理页转移到新块里
+            for vpn in VPNRange::new(end_vpn, old_end) {
+                if let Some(frame) = self.areas[idx].data_frames.remove(&vpn) {
+                    right_area.data_frames.insert(vpn, frame);
+                }
+            }
+            self.areas.push(right_area);
+        }
+
+        // 处理左半部分：如果解绑区域不从开头开始，左边剩下的保留
+        if old_start < start_vpn {
+            self.areas[idx].vpn_range = VPNRange::new(old_start, start_vpn);
+        } else {
+            // 如果是从头开始解绑的，原本的头部 Area 就可以丢弃了
+            self.areas.remove(idx);
+        }
+
+        return 0;
+    }
     -1
 }
  

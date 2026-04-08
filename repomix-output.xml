@@ -1,0 +1,4600 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.github/
+  workflows/
+    build.yml
+bootloader/
+  rustsbi-qemu.bin
+os/
+  .cargo/
+    config.toml
+  src/
+    boards/
+      qemu.rs
+    mm/
+      address.rs
+      frame_allocator.rs
+      heap_allocator.rs
+      memory_set.rs
+      mod.rs
+      page_table.rs
+    sync/
+      mod.rs
+      up.rs
+    syscall/
+      fs.rs
+      mod.rs
+      process.rs
+    task/
+      context.rs
+      mod.rs
+      switch.rs
+      switch.S
+      task.rs
+    trap/
+      context.rs
+      mod.rs
+      trap.S
+    batch.rs
+    config.rs
+    console.rs
+    entry.asm
+    heap_alloc.rs
+    lang_items.rs
+    linker.ld
+    loader.rs
+    logging.rs
+    main.rs
+    sbi.rs
+    timer.rs
+  build.rs
+  Cargo.toml
+  Makefile
+.dockerignore
+.gitignore
+Dockerfile
+LICENSE
+Makefile
+merge_chain.sh
+README.md
+rust-toolchain.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="os/.cargo/config.toml">
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-Clink-arg=-Tsrc/linker.ld", "-Cforce-frame-pointers=yes"
+]
+</file>
+
+<file path="os/src/boards/qemu.rs">
+//ref:: https://github.com/andre-richter/qemu-exit
+use core::arch::asm;
+
+const EXIT_SUCCESS: u32 = 0x5555; // Equals `exit(0)`. qemu successful exit
+
+const EXIT_FAILURE_FLAG: u32 = 0x3333;
+const EXIT_FAILURE: u32 = exit_code_encode(1); // Equals `exit(1)`. qemu failed exit
+const EXIT_RESET: u32 = 0x7777; // qemu reset
+
+pub trait QEMUExit {
+    /// Exit with specified return code.
+    ///
+    /// Note: For `X86`, code is binary-OR'ed with `0x1` inside QEMU.
+    fn exit(&self, code: u32) -> !;
+
+    /// Exit QEMU using `EXIT_SUCCESS`, aka `0`, if possible.
+    ///
+    /// Note: Not possible for `X86`.
+    fn exit_success(&self) -> !;
+
+    /// Exit QEMU using `EXIT_FAILURE`, aka `1`.
+    fn exit_failure(&self) -> !;
+}
+
+/// RISCV64 configuration
+pub struct RISCV64 {
+    /// Address of the sifive_test mapped device.
+    addr: u64,
+}
+
+/// Encode the exit code using EXIT_FAILURE_FLAG.
+const fn exit_code_encode(code: u32) -> u32 {
+    (code << 16) | EXIT_FAILURE_FLAG
+}
+
+impl RISCV64 {
+    /// Create an instance.
+    pub const fn new(addr: u64) -> Self {
+        RISCV64 { addr }
+    }
+}
+
+impl QEMUExit for RISCV64 {
+    /// Exit qemu with specified exit code.
+    fn exit(&self, code: u32) -> ! {
+        // If code is not a special value, we need to encode it with EXIT_FAILURE_FLAG.
+        let code_new = match code {
+            EXIT_SUCCESS | EXIT_FAILURE | EXIT_RESET => code,
+            _ => exit_code_encode(code),
+        };
+
+        unsafe {
+            asm!(
+                "sw {0}, 0({1})",
+                in(reg)code_new, in(reg)self.addr
+            );
+
+            // For the case that the QEMU exit attempt did not work, transition into an infinite
+            // loop. Calling `panic!()` here is unfeasible, since there is a good chance
+            // this function here is the last expression in the `panic!()` handler
+            // itself. This prevents a possible infinite loop.
+            loop {
+                asm!("wfi", options(nomem, nostack));
+            }
+        }
+    }
+
+    fn exit_success(&self) -> ! {
+        self.exit(EXIT_SUCCESS);
+    }
+
+    fn exit_failure(&self) -> ! {
+        self.exit(EXIT_FAILURE);
+    }
+}
+
+const VIRT_TEST: u64 = 0x100000;
+
+pub const QEMU_EXIT_HANDLE: RISCV64 = RISCV64::new(VIRT_TEST);
+</file>
+
+<file path="os/src/mm/address.rs">
+//! Implementation of physical and virtual address and page number.
+use super::PageTableEntry;
+use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
+use core::fmt::{self, Debug, Formatter};
+/// physical address
+const PA_WIDTH_SV39: usize = 56;
+const VA_WIDTH_SV39: usize = 39;
+const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
+const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
+
+/// physical address
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct PhysAddr(pub usize);
+/// virtual address
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct VirtAddr(pub usize);
+/// physical page number
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct PhysPageNum(pub usize);
+/// virtual page number
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct VirtPageNum(pub usize);
+
+/// Debugging
+
+impl Debug for VirtAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("VA:{:#x}", self.0))
+    }
+}
+impl Debug for VirtPageNum {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("VPN:{:#x}", self.0))
+    }
+}
+impl Debug for PhysAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("PA:{:#x}", self.0))
+    }
+}
+impl Debug for PhysPageNum {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("PPN:{:#x}", self.0))
+    }
+}
+
+/// T: {PhysAddr, VirtAddr, PhysPageNum, VirtPageNum}
+/// T -> usize: T.0
+/// usize -> T: usize.into()
+
+impl From<usize> for PhysAddr {
+    fn from(v: usize) -> Self {
+        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+    }
+}
+impl From<usize> for PhysPageNum {
+    fn from(v: usize) -> Self {
+        Self(v & ((1 << PPN_WIDTH_SV39) - 1))
+    }
+}
+impl From<usize> for VirtAddr {
+    fn from(v: usize) -> Self {
+        Self(v & ((1 << VA_WIDTH_SV39) - 1))
+    }
+}
+impl From<usize> for VirtPageNum {
+    fn from(v: usize) -> Self {
+        Self(v & ((1 << VPN_WIDTH_SV39) - 1))
+    }
+}
+impl From<PhysAddr> for usize {
+    fn from(v: PhysAddr) -> Self {
+        v.0
+    }
+}
+impl From<PhysPageNum> for usize {
+    fn from(v: PhysPageNum) -> Self {
+        v.0
+    }
+}
+impl From<VirtAddr> for usize {
+    fn from(v: VirtAddr) -> Self {
+        if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
+            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
+        } else {
+            v.0
+        }
+    }
+}
+impl From<VirtPageNum> for usize {
+    fn from(v: VirtPageNum) -> Self {
+        v.0
+    }
+}
+/// virtual address impl
+impl VirtAddr {
+    /// Get the (floor) virtual page number
+    pub fn floor(&self) -> VirtPageNum {
+        VirtPageNum(self.0 / PAGE_SIZE)
+    }
+
+    /// Get the (ceil) virtual page number
+    pub fn ceil(&self) -> VirtPageNum {
+        VirtPageNum((self.0 - 1 + PAGE_SIZE) / PAGE_SIZE)
+    }
+
+    /// Get the page offset of virtual address
+    pub fn page_offset(&self) -> usize {
+        self.0 & (PAGE_SIZE - 1)
+    }
+
+    /// Check if the virtual address is aligned by page size
+    pub fn aligned(&self) -> bool {
+        self.page_offset() == 0
+    }
+}
+impl From<VirtAddr> for VirtPageNum {
+    fn from(v: VirtAddr) -> Self {
+        assert_eq!(v.page_offset(), 0);
+        v.floor()
+    }
+}
+impl From<VirtPageNum> for VirtAddr {
+    fn from(v: VirtPageNum) -> Self {
+        Self(v.0 << PAGE_SIZE_BITS)
+    }
+}
+impl PhysAddr {
+    /// Get the (floor) physical page number
+    pub fn floor(&self) -> PhysPageNum {
+        PhysPageNum(self.0 / PAGE_SIZE)
+    }
+    /// Get the (ceil) physical page number
+    pub fn ceil(&self) -> PhysPageNum {
+        PhysPageNum((self.0 - 1 + PAGE_SIZE) / PAGE_SIZE)
+    }
+    /// Get the page offset of physical address
+    pub fn page_offset(&self) -> usize {
+        self.0 & (PAGE_SIZE - 1)
+    }
+    /// Check if the physical address is aligned by page size
+    pub fn aligned(&self) -> bool {
+        self.page_offset() == 0
+    }
+}
+impl From<PhysAddr> for PhysPageNum {
+    fn from(v: PhysAddr) -> Self {
+        assert_eq!(v.page_offset(), 0);
+        v.floor()
+    }
+}
+impl From<PhysPageNum> for PhysAddr {
+    fn from(v: PhysPageNum) -> Self {
+        Self(v.0 << PAGE_SIZE_BITS)
+    }
+}
+
+impl VirtPageNum {
+    /// Get the indexes of the page table entry
+    pub fn indexes(&self) -> [usize; 3] {
+        let mut vpn = self.0;
+        let mut idx = [0usize; 3];
+        for i in (0..3).rev() {
+            idx[i] = vpn & 511;
+            vpn >>= 9;
+        }
+        idx
+    }
+}
+
+impl PhysAddr {
+    ///Get mutable reference to `PhysAddr` value
+    /// Get the mutable reference of physical address
+    pub fn get_mut<T>(&self) -> &'static mut T {
+        unsafe { (self.0 as *mut T).as_mut().unwrap() }
+    }
+}
+impl PhysPageNum {
+    /// Get the reference of page table(array of ptes)
+    pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
+        let pa: PhysAddr = (*self).into();
+        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
+    }
+    /// Get the reference of page(array of bytes)
+    pub fn get_bytes_array(&self) -> &'static mut [u8] {
+        let pa: PhysAddr = (*self).into();
+        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
+    }
+    /// Get the mutable reference of physical address
+    pub fn get_mut<T>(&self) -> &'static mut T {
+        let pa: PhysAddr = (*self).into();
+        pa.get_mut()
+    }
+}
+
+/// iterator for phy/virt page number
+pub trait StepByOne {
+    /// step by one element(page number)
+    fn step(&mut self);
+}
+impl StepByOne for VirtPageNum {
+    fn step(&mut self) {
+        self.0 += 1;
+    }
+}
+
+#[derive(Copy, Clone)]
+/// a simple range structure for type T
+pub struct SimpleRange<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    l: T,
+    r: T,
+}
+impl<T> SimpleRange<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    pub fn new(start: T, end: T) -> Self {
+        assert!(start <= end, "start {:?} > end {:?}!", start, end);
+        Self { l: start, r: end }
+    }
+    pub fn get_start(&self) -> T {
+        self.l
+    }
+    pub fn get_end(&self) -> T {
+        self.r
+    }
+}
+impl<T> IntoIterator for SimpleRange<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    type Item = T;
+    type IntoIter = SimpleRangeIterator<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        SimpleRangeIterator::new(self.l, self.r)
+    }
+}
+/// iterator for the simple range structure
+pub struct SimpleRangeIterator<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    current: T,
+    end: T,
+}
+impl<T> SimpleRangeIterator<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    pub fn new(l: T, r: T) -> Self {
+        Self { current: l, end: r }
+    }
+}
+impl<T> Iterator for SimpleRangeIterator<T>
+where
+    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
+{
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.end {
+            None
+        } else {
+            let t = self.current;
+            self.current.step();
+            Some(t)
+        }
+    }
+}
+/// a simple range structure for virtual page number
+pub type VPNRange = SimpleRange<VirtPageNum>;
+</file>
+
+<file path="os/src/mm/frame_allocator.rs">
+//! Implementation of [`FrameAllocator`] which
+//! controls all the frames in the operating system.
+
+use super::{PhysAddr, PhysPageNum};
+use crate::config::MEMORY_END;
+use crate::sync::UPSafeCell;
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Formatter};
+use lazy_static::*;
+
+/// tracker for physical page frame allocation and deallocation
+pub struct FrameTracker {
+    /// physical page number
+    pub ppn: PhysPageNum,
+}
+
+impl FrameTracker {
+    /// Create a new FrameTracker
+    pub fn new(ppn: PhysPageNum) -> Self {
+        // page cleaning
+        let bytes_array = ppn.get_bytes_array();
+        for i in bytes_array {
+            *i = 0;
+        }
+        Self { ppn }
+    }
+}
+
+impl Debug for FrameTracker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("FrameTracker:PPN={:#x}", self.ppn.0))
+    }
+}
+
+impl Drop for FrameTracker {
+    fn drop(&mut self) {
+        frame_dealloc(self.ppn);
+    }
+}
+
+trait FrameAllocator {
+    fn new() -> Self;
+    fn alloc(&mut self) -> Option<PhysPageNum>;
+    fn dealloc(&mut self, ppn: PhysPageNum);
+}
+/// an implementation for frame allocator
+pub struct StackFrameAllocator {
+    current: usize,
+    end: usize,
+    recycled: Vec<usize>,
+}
+
+impl StackFrameAllocator {
+    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
+        self.current = l.0;
+        self.end = r.0;
+        // trace!("last {} Physical Frames.", self.end - self.current);
+    }
+}
+impl FrameAllocator for StackFrameAllocator {
+    fn new() -> Self {
+        Self {
+            current: 0,
+            end: 0,
+            recycled: Vec::new(),
+        }
+    }
+    fn alloc(&mut self) -> Option<PhysPageNum> {
+        if let Some(ppn) = self.recycled.pop() {
+            Some(ppn.into())
+        } else if self.current == self.end {
+            None
+        } else {
+            self.current += 1;
+            Some((self.current - 1).into())
+        }
+    }
+    fn dealloc(&mut self, ppn: PhysPageNum) {
+        let ppn = ppn.0;
+        // validity check
+        if ppn >= self.current || self.recycled.iter().any(|&v| v == ppn) {
+            panic!("Frame ppn={:#x} has not been allocated!", ppn);
+        }
+        // recycle
+        self.recycled.push(ppn);
+    }
+}
+
+type FrameAllocatorImpl = StackFrameAllocator;
+
+lazy_static! {
+    /// frame allocator instance through lazy_static!
+    pub static ref FRAME_ALLOCATOR: UPSafeCell<FrameAllocatorImpl> =
+        unsafe { UPSafeCell::new(FrameAllocatorImpl::new()) };
+}
+/// initiate the frame allocator using `ekernel` and `MEMORY_END`
+pub fn init_frame_allocator() {
+    extern "C" {
+        fn ekernel();
+    }
+    FRAME_ALLOCATOR.exclusive_access().init(
+        PhysAddr::from(ekernel as usize).ceil(),
+        PhysAddr::from(MEMORY_END).floor(),
+    );
+}
+
+/// Allocate a physical page frame in FrameTracker style
+pub fn frame_alloc() -> Option<FrameTracker> {
+    FRAME_ALLOCATOR
+        .exclusive_access()
+        .alloc()
+        .map(FrameTracker::new)
+}
+
+/// Deallocate a physical page frame with a given ppn
+pub fn frame_dealloc(ppn: PhysPageNum) {
+    FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
+}
+
+#[allow(unused)]
+/// a simple test for frame allocator
+pub fn frame_allocator_test() {
+    let mut v: Vec<FrameTracker> = Vec::new();
+    for i in 0..5 {
+        let frame = frame_alloc().unwrap();
+        println!("{:?}", frame);
+        v.push(frame);
+    }
+    v.clear();
+    for i in 0..5 {
+        let frame = frame_alloc().unwrap();
+        println!("{:?}", frame);
+        v.push(frame);
+    }
+    drop(v);
+    println!("frame_allocator_test passed!");
+}
+</file>
+
+<file path="os/src/mm/heap_allocator.rs">
+//! The global allocator
+use crate::config::KERNEL_HEAP_SIZE;
+use buddy_system_allocator::LockedHeap;
+
+#[global_allocator]
+/// heap allocator instance
+static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+#[alloc_error_handler]
+/// panic when heap allocation error occurs
+pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+    panic!("Heap allocation error, layout = {:?}", layout);
+}
+/// heap space ([u8; KERNEL_HEAP_SIZE])
+static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
+/// initiate heap allocator
+pub fn init_heap() {
+    unsafe {
+        HEAP_ALLOCATOR
+            .lock()
+            .init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
+    }
+}
+
+#[allow(unused)]
+pub fn heap_test() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    extern "C" {
+        fn sbss();
+        fn ebss();
+    }
+    let bss_range = sbss as usize..ebss as usize;
+    let a = Box::new(5);
+    assert_eq!(*a, 5);
+    assert!(bss_range.contains(&(a.as_ref() as *const _ as usize)));
+    drop(a);
+    let mut v: Vec<usize> = Vec::new();
+    for i in 0..500 {
+        v.push(i);
+    }
+    for (i, val) in v.iter().take(500).enumerate() {
+        assert_eq!(*val, i);
+    }
+    assert!(bss_range.contains(&(v.as_ptr() as usize)));
+    drop(v);
+    println!("heap_test passed!");
+}
+</file>
+
+<file path="os/src/mm/mod.rs">
+//! Memory management implementation
+//!
+//! SV39 page-based virtual-memory architecture for RV64 systems, and
+//! everything about memory management, like frame allocator, page table,
+//! map area and memory set, is implemented here.
+//!
+//! Every task or process has a memory_set to control its virtual memory.
+
+mod address;
+mod frame_allocator;
+mod heap_allocator;
+mod memory_set;
+mod page_table;
+
+pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
+use address::{StepByOne, VPNRange};
+pub use frame_allocator::{frame_alloc, FrameTracker};
+pub use memory_set::remap_test;
+pub use memory_set::{kernel_stack_position, MapPermission, MemorySet, KERNEL_SPACE};
+pub use page_table::{translated_byte_buffer, PageTableEntry};
+pub use page_table::{PTEFlags, PageTable};
+
+/// initiate heap allocator, frame allocator and kernel space
+pub fn init() {
+    heap_allocator::init_heap();
+    frame_allocator::init_frame_allocator();
+    KERNEL_SPACE.exclusive_access().activate();
+}
+</file>
+
+<file path="os/src/mm/page_table.rs">
+//! Implementation of [`PageTableEntry`] and [`PageTable`].
+
+use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use alloc::vec;
+use alloc::vec::Vec;
+use bitflags::*;
+
+bitflags! {
+    /// page table entry flags
+    pub struct PTEFlags: u8 {
+        /// Valid
+        const V = 1 << 0;
+        /// Readable
+        const R = 1 << 1;
+        /// Writable
+        const W = 1 << 2;
+        /// eXecutable
+        const X = 1 << 3;
+        /// User
+        const U = 1 << 4;
+        /// Global
+        const G = 1 << 5;
+        /// Accessed
+        const A = 1 << 6;
+        /// Dirty
+        const D = 1 << 7;
+    }
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+/// page table entry structure
+pub struct PageTableEntry {
+    /// bits of page table entry
+    pub bits: usize,
+}
+
+impl PageTableEntry {
+    /// Create a new page table entry
+    pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
+        PageTableEntry {
+            bits: ppn.0 << 10 | flags.bits as usize,
+        }
+    }
+    /// Create an empty page table entry
+    pub fn empty() -> Self {
+        PageTableEntry { bits: 0 }
+    }
+    /// Get the physical page number from the page table entry
+    pub fn ppn(&self) -> PhysPageNum {
+        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+    }
+    /// Get the flags from the page table entry
+    pub fn flags(&self) -> PTEFlags {
+        PTEFlags::from_bits(self.bits as u8).unwrap()
+    }
+    /// The page pointered by page table entry is valid?
+    pub fn is_valid(&self) -> bool {
+        (self.flags() & PTEFlags::V) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is readable?
+    pub fn readable(&self) -> bool {
+        (self.flags() & PTEFlags::R) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is writable?
+    pub fn writable(&self) -> bool {
+        (self.flags() & PTEFlags::W) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry is executable?
+    pub fn executable(&self) -> bool {
+        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+    }
+}
+
+/// page table structure
+pub struct PageTable {
+    root_ppn: PhysPageNum,
+    frames: Vec<FrameTracker>,
+}
+
+/// Assume that it won't oom when creating/mapping.
+impl PageTable {
+    /// Create a new page table
+    pub fn new() -> Self {
+        let frame = frame_alloc().unwrap();
+        PageTable {
+            root_ppn: frame.ppn,
+            frames: vec![frame],
+        }
+    }
+    /// Temporarily used to get arguments from user space.
+    pub fn from_token(satp: usize) -> Self {
+        Self {
+            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
+            frames: Vec::new(),
+        }
+    }
+    /// Find PageTableEntry by VirtPageNum, create a frame for a 4KB page table if not exist
+    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        let mut result: Option<&mut PageTableEntry> = None;
+        for (i, idx) in idxs.iter().enumerate() {
+            let pte = &mut ppn.get_pte_array()[*idx];
+            if i == 2 {
+                result = Some(pte);
+                break;
+            }
+            if !pte.is_valid() {
+                let frame = frame_alloc().unwrap();
+                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                self.frames.push(frame);
+            }
+            ppn = pte.ppn();
+        }
+        result
+    }
+    /// Find PageTableEntry by VirtPageNum
+    fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        let mut result: Option<&mut PageTableEntry> = None;
+        for (i, idx) in idxs.iter().enumerate() {
+            let pte = &mut ppn.get_pte_array()[*idx];
+            if i == 2 {
+                result = Some(pte);
+                break;
+            }
+            if !pte.is_valid() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        result
+    }
+    /// set the map between virtual page number and physical page number
+    #[allow(unused)]
+    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte_create(vpn).unwrap();
+        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
+    /// remove the map between virtual page number and physical page number
+    #[allow(unused)]
+    pub fn unmap(&mut self, vpn: VirtPageNum) {
+        let pte = self.find_pte(vpn).unwrap();
+        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+        *pte = PageTableEntry::empty();
+    }
+    /// get the page table entry from the virtual page number
+    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        self.find_pte(vpn).map(|pte| *pte)
+    }
+    /// get the token from the page table
+    pub fn token(&self) -> usize {
+        8usize << 60 | self.root_ppn.0
+    }
+}
+
+/// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
+pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start + len;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let ppn = page_table.translate(vpn).unwrap().ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    v
+}
+</file>
+
+<file path="os/src/sync/mod.rs">
+//! Synchronization and interior mutability primitives
+
+mod up;
+
+pub use up::UPSafeCell;
+</file>
+
+<file path="os/src/sync/up.rs">
+//! Uniprocessor interior mutability primitives
+use core::cell::{RefCell, RefMut};
+
+/// Wrap a static data structure inside it so that we are
+/// able to access it without any `unsafe`.
+///
+/// We should only use it in uniprocessor.
+///
+/// In order to get mutable reference of inner data, call
+/// `exclusive_access`.
+pub struct UPSafeCell<T> {
+    /// inner data
+    inner: RefCell<T>,
+}
+
+unsafe impl<T> Sync for UPSafeCell<T> {}
+
+impl<T> UPSafeCell<T> {
+    /// User is responsible to guarantee that inner struct is only used in
+    /// uniprocessor.
+    pub unsafe fn new(value: T) -> Self {
+        Self {
+            inner: RefCell::new(value),
+        }
+    }
+    /// Panic if the data has been borrowed.
+    pub fn exclusive_access(&self) -> RefMut<'_, T> {
+        self.inner.borrow_mut()
+    }
+}
+</file>
+
+<file path="os/src/syscall/fs.rs">
+//! File and filesystem-related syscalls
+
+use crate::mm::translated_byte_buffer;
+use crate::task::current_user_token;
+
+const FD_STDOUT: usize = 1;
+
+/// write buf of length `len`  to a file with `fd`
+pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
+    trace!("kernel: sys_write");
+    match fd {
+        FD_STDOUT => {
+            let buffers = translated_byte_buffer(current_user_token(), buf, len);
+            for buffer in buffers {
+                print!("{}", core::str::from_utf8(buffer).unwrap());
+            }
+            len as isize
+        }
+        _ => {
+            panic!("Unsupported fd in sys_write!");
+        }
+    }
+}
+</file>
+
+<file path="os/src/task/context.rs">
+//! Implementation of [`TaskContext`]
+use crate::trap::trap_return;
+
+#[repr(C)]
+/// task context structure containing some registers
+pub struct TaskContext {
+    /// Ret position after task switching
+    ra: usize,
+    /// Stack pointer
+    sp: usize,
+    /// s0-11 register, callee saved
+    s: [usize; 12],
+}
+
+impl TaskContext {
+    /// Create a new empty task context
+    pub fn zero_init() -> Self {
+        Self {
+            ra: 0,
+            sp: 0,
+            s: [0; 12],
+        }
+    }
+    /// Create a new task context with a trap return addr and a kernel stack pointer
+    pub fn goto_trap_return(kstack_ptr: usize) -> Self {
+        Self {
+            ra: trap_return as usize,
+            sp: kstack_ptr,
+            s: [0; 12],
+        }
+    }
+}
+</file>
+
+<file path="os/src/task/switch.rs">
+//! Rust wrapper around `__switch`.
+//!
+//! Switching to a different task's context happens here. The actual
+//! implementation must not be in Rust and (essentially) has to be in assembly
+//! language (Do you know why?), so this module really is just a wrapper around
+//! `switch.S`.
+
+core::arch::global_asm!(include_str!("switch.S"));
+use super::TaskContext;
+
+extern "C" {
+    /// Switch to the context of `next_task_cx_ptr`, saving the current context
+    /// in `current_task_cx_ptr`.
+    pub fn __switch(current_task_cx_ptr: *mut TaskContext, next_task_cx_ptr: *const TaskContext);
+}
+</file>
+
+<file path="os/src/task/switch.S">
+.altmacro
+.macro SAVE_SN n
+    sd s\n, (\n+2)*8(a0)
+.endm
+.macro LOAD_SN n
+    ld s\n, (\n+2)*8(a1)
+.endm
+    .section .text
+    .globl __switch
+__switch:
+    # __switch(
+    #     current_task_cx_ptr: *mut TaskContext,
+    #     next_task_cx_ptr: *const TaskContext
+    # )
+    # save kernel stack of current task
+    sd sp, 8(a0)
+    # save ra & s0~s11 of current execution
+    sd ra, 0(a0)
+    .set n, 0
+    .rept 12
+        SAVE_SN %n
+        .set n, n + 1
+    .endr
+    # restore ra & s0~s11 of next execution
+    ld ra, 0(a1)
+    .set n, 0
+    .rept 12
+        LOAD_SN %n
+        .set n, n + 1
+    .endr
+    # restore kernel stack of next task
+    ld sp, 8(a1)
+    ret
+</file>
+
+<file path="os/src/trap/context.rs">
+//! Implementation of [`TrapContext`]
+use riscv::register::sstatus::{self, Sstatus, SPP};
+
+#[repr(C)]
+#[derive(Debug)]
+/// trap context structure containing sstatus, sepc and registers
+pub struct TrapContext {
+    /// General-Purpose Register x0-31
+    pub x: [usize; 32],
+    /// Supervisor Status Register
+    pub sstatus: Sstatus,
+    /// Supervisor Exception Program Counter
+    pub sepc: usize,
+    /// Token of kernel address space
+    pub kernel_satp: usize,
+    /// Kernel stack pointer of the current application
+    pub kernel_sp: usize,
+    /// Virtual address of trap handler entry point in kernel
+    pub trap_handler: usize,
+}
+
+impl TrapContext {
+    /// put the sp(stack pointer) into x\[2\] field of TrapContext
+    pub fn set_sp(&mut self, sp: usize) {
+        self.x[2] = sp;
+    }
+    /// init the trap context of an application
+    pub fn app_init_context(
+        entry: usize,
+        sp: usize,
+        kernel_satp: usize,
+        kernel_sp: usize,
+        trap_handler: usize,
+    ) -> Self {
+        let mut sstatus = sstatus::read();
+        // set CPU privilege to User after trapping back
+        sstatus.set_spp(SPP::User);
+        let mut cx = Self {
+            x: [0; 32],
+            sstatus,
+            sepc: entry,  // entry point of app
+            kernel_satp,  // addr of page table
+            kernel_sp,    // kernel stack
+            trap_handler, // addr of trap_handler function
+        };
+        cx.set_sp(sp); // app's user stack pointer
+        cx // return initial Trap Context of app
+    }
+}
+</file>
+
+<file path="os/src/trap/mod.rs">
+//! Trap handling functionality
+//!
+//! For rCore, we have a single trap entry point, namely `__alltraps`. At
+//! initialization in [`init()`], we set the `stvec` CSR to point to it.
+//!
+//! All traps go through `__alltraps`, which is defined in `trap.S`. The
+//! assembly language code does just enough work restore the kernel space
+//! context, ensuring that Rust code safely runs, and transfers control to
+//! [`trap_handler()`].
+//!
+//! It then calls different functionality based on what exactly the exception
+//! was. For example, timer interrupts trigger task preemption, and syscalls go
+//! to [`syscall()`].
+
+mod context;
+
+use crate::config::{TRAMPOLINE, TRAP_CONTEXT_BASE};
+use crate::syscall::syscall;
+use crate::task::{
+    current_trap_cx, current_user_token, exit_current_and_run_next, suspend_current_and_run_next,
+};
+use crate::timer::set_next_trigger;
+use core::arch::{asm, global_asm};
+use riscv::register::{
+    mtvec::TrapMode,
+    scause::{self, Exception, Interrupt, Trap},
+    sie, stval, stvec,
+};
+
+global_asm!(include_str!("trap.S"));
+
+/// Initialize trap handling
+pub fn init() {
+    set_kernel_trap_entry();
+}
+
+fn set_kernel_trap_entry() {
+    extern "C" {
+        fn __trap_from_kernel();
+    }
+    unsafe {
+        stvec::write(__trap_from_kernel as usize, TrapMode::Direct);
+    }
+}
+
+fn set_user_trap_entry() {
+    unsafe {
+        stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
+    }
+}
+
+/// enable timer interrupt in supervisor mode
+pub fn enable_timer_interrupt() {
+    unsafe {
+        sie::set_stimer();
+    }
+}
+
+/// trap handler
+#[no_mangle]
+pub fn trap_handler() -> ! {
+    set_kernel_trap_entry();
+    let cx = current_trap_cx();
+    let scause = scause::read(); // get trap cause
+    let stval = stval::read(); // get extra value
+
+    // trace!("into {:?}", scause.cause());
+    match scause.cause() {
+        Trap::Exception(Exception::UserEnvCall) => {
+            // jump to next instruction anyway
+            cx.sepc += 4;
+            // get system call return value
+            cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
+        }
+        Trap::Exception(Exception::StoreFault)
+        | Trap::Exception(Exception::StorePageFault)
+        | Trap::Exception(Exception::LoadFault)
+        | Trap::Exception(Exception::LoadPageFault) => {
+            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.", stval, cx.sepc);
+            exit_current_and_run_next();
+        }
+        Trap::Exception(Exception::IllegalInstruction) => {
+            println!("[kernel] IllegalInstruction in application, kernel killed it.");
+            exit_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            set_next_trigger();
+            suspend_current_and_run_next();
+        }
+        _ => {
+            panic!(
+                "Unsupported trap {:?}, stval = {:#x}!",
+                scause.cause(),
+                stval
+            );
+        }
+    }
+    //println!("before trap_return");
+    trap_return();
+}
+
+#[no_mangle]
+/// return to user space
+/// set the new addr of __restore asm function in TRAMPOLINE page,
+/// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
+/// finally, jump to new addr of __restore asm function
+pub fn trap_return() -> ! {
+    set_user_trap_entry();
+    let trap_cx_ptr = TRAP_CONTEXT_BASE;
+    let user_satp = current_user_token();
+    extern "C" {
+        fn __alltraps();
+        fn __restore();
+    }
+    let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
+    // trace!("[kernel] trap_return: ..before return");
+    unsafe {
+        asm!(
+            "fence.i",
+            "jr {restore_va}",         // jump to new addr of __restore asm function
+            restore_va = in(reg) restore_va,
+            in("a0") trap_cx_ptr,      // a0 = virt addr of Trap Context
+            in("a1") user_satp,        // a1 = phy addr of usr page table
+            options(noreturn)
+        );
+    }
+}
+
+#[no_mangle]
+/// handle trap from kernel
+/// Unimplement: traps/interrupts/exceptions from kernel mode
+/// Todo: Chapter 9: I/O device
+pub fn trap_from_kernel() -> ! {
+    use riscv::register::sepc;
+    trace!("stval = {:#x}, sepc = {:#x}", stval::read(), sepc::read());
+    panic!("a trap {:?} from kernel!", scause::read().cause());
+}
+
+pub use context::TrapContext;
+</file>
+
+<file path="os/src/trap/trap.S">
+.altmacro
+.macro SAVE_GP n
+    sd x\n, \n*8(sp)
+.endm
+.macro LOAD_GP n
+    ld x\n, \n*8(sp)
+.endm
+    .section .text.trampoline
+    .globl __alltraps
+    .globl __restore
+    .align 2
+__alltraps:
+    csrrw sp, sscratch, sp
+    # now sp->*TrapContext in user space, sscratch->user stack
+    # save other general purpose registers
+    sd x1, 1*8(sp)
+    # skip sp(x2), we will save it later
+    sd x3, 3*8(sp)
+    # skip tp(x4), application does not use it
+    # save x5~x31
+    .set n, 5
+    .rept 27
+        SAVE_GP %n
+        .set n, n+1
+    .endr
+    # we can use t0/t1/t2 freely, because they have been saved in TrapContext
+    csrr t0, sstatus
+    csrr t1, sepc
+    sd t0, 32*8(sp)
+    sd t1, 33*8(sp)
+    # read user stack from sscratch and save it in TrapContext
+    csrr t2, sscratch
+    sd t2, 2*8(sp)
+    # load kernel_satp into t0
+    ld t0, 34*8(sp)
+    # load trap_handler into t1
+    ld t1, 36*8(sp)
+    # move to kernel_sp
+    ld sp, 35*8(sp)
+    # switch to kernel space
+    csrw satp, t0
+    sfence.vma
+    # jump to trap_handler
+    jr t1
+
+__restore:
+    # a0: *TrapContext in user space(Constant); a1: user space token
+    # switch to user space
+    csrw satp, a1
+    sfence.vma
+    csrw sscratch, a0
+    mv sp, a0
+    # now sp points to TrapContext in user space, start restoring based on it
+    # restore sstatus/sepc
+    ld t0, 32*8(sp)
+    ld t1, 33*8(sp)
+    csrw sstatus, t0
+    csrw sepc, t1
+    # restore general purpose registers except x0/sp/tp
+    ld x1, 1*8(sp)
+    ld x3, 3*8(sp)
+    .set n, 5
+    .rept 27
+        LOAD_GP %n
+        .set n, n+1
+    .endr
+    # back to user stack
+    ld sp, 2*8(sp)
+    sret
+
+    .section .data
+    # emergency stack for kernel trap
+    # in order to print trap info even if the kernel stack is corrupted.
+__emergency:
+    .align 4
+    .space 1024 * 4
+__emergency_end:
+
+
+    .section .text
+    .globl __trap_from_kernel
+    # 2^2=4 bytes aligned for stvec
+    .align 2
+__trap_from_kernel:
+    la sp, __emergency_end
+    j trap_from_kernel
+</file>
+
+<file path="os/src/batch.rs">
+//! batch subsystem
+
+use crate::sync::UPSafeCell;
+use crate::trap::TrapContext;
+use core::arch::asm;
+use lazy_static::*;
+
+const USER_STACK_SIZE: usize = 4096 * 2;
+const KERNEL_STACK_SIZE: usize = 4096 * 2;
+const MAX_APP_NUM: usize = 16;
+const APP_BASE_ADDRESS: usize = 0x80400000;
+const APP_SIZE_LIMIT: usize = 0x20000;
+
+#[repr(align(4096))]
+struct KernelStack {
+    data: [u8; KERNEL_STACK_SIZE],
+}
+
+#[repr(align(4096))]
+struct UserStack {
+    data: [u8; USER_STACK_SIZE],
+}
+
+static KERNEL_STACK: KernelStack = KernelStack {
+    data: [0; KERNEL_STACK_SIZE],
+};
+static USER_STACK: UserStack = UserStack {
+    data: [0; USER_STACK_SIZE],
+};
+
+impl KernelStack {
+    fn get_sp(&self) -> usize {
+        self.data.as_ptr() as usize + KERNEL_STACK_SIZE
+    }
+    pub fn push_context(&self, cx: TrapContext) -> &'static mut TrapContext {
+        let cx_ptr = (self.get_sp() - core::mem::size_of::<TrapContext>()) as *mut TrapContext;
+        unsafe {
+            *cx_ptr = cx;
+        }
+        unsafe { cx_ptr.as_mut().unwrap() }
+    }
+}
+
+impl UserStack {
+    fn get_sp(&self) -> usize {
+        self.data.as_ptr() as usize + USER_STACK_SIZE
+    }
+}
+
+struct AppManager {
+    num_app: usize,
+    current_app: usize,
+    app_start: [usize; MAX_APP_NUM + 1],
+}
+
+impl AppManager {
+    pub fn print_app_info(&self) {
+        println!("[kernel] num_app = {}", self.num_app);
+        for i in 0..self.num_app {
+            println!(
+                "[kernel] app_{} [{:#x}, {:#x})",
+                i,
+                self.app_start[i],
+                self.app_start[i + 1]
+            );
+        }
+    }
+
+    unsafe fn load_app(&self, app_id: usize) {
+        if app_id >= self.num_app {
+            println!("All applications completed!");
+            use crate::board::QEMUExit;
+            crate::board::QEMU_EXIT_HANDLE.exit_success();
+        }
+        println!("[kernel] Loading app_{}", app_id);
+        // clear app area
+        core::slice::from_raw_parts_mut(APP_BASE_ADDRESS as *mut u8, APP_SIZE_LIMIT).fill(0);
+        let app_src = core::slice::from_raw_parts(
+            self.app_start[app_id] as *const u8,
+            self.app_start[app_id + 1] - self.app_start[app_id],
+        );
+        let app_dst = core::slice::from_raw_parts_mut(APP_BASE_ADDRESS as *mut u8, app_src.len());
+        app_dst.copy_from_slice(app_src);
+        // Memory fence about fetching the instruction memory
+        // It is guaranteed that a subsequent instruction fetch must
+        // observes all previous writes to the instruction memory.
+        // Therefore, fence.i must be executed after we have loaded
+        // the code of the next app into the instruction memory.
+        // See also: riscv non-priv spec chapter 3, 'Zifencei' extension.
+        asm!("fence.i");
+    }
+
+    pub fn get_current_app(&self) -> usize {
+        self.current_app
+    }
+
+    pub fn move_to_next_app(&mut self) {
+        self.current_app += 1;
+    }
+}
+
+lazy_static! {
+    static ref APP_MANAGER: UPSafeCell<AppManager> = unsafe {
+        UPSafeCell::new({
+            extern "C" {
+                fn _num_app();
+            }
+            let num_app_ptr = _num_app as usize as *const usize;
+            let num_app = num_app_ptr.read_volatile();
+            let mut app_start: [usize; MAX_APP_NUM + 1] = [0; MAX_APP_NUM + 1];
+            let app_start_raw: &[usize] =
+                core::slice::from_raw_parts(num_app_ptr.add(1), num_app + 1);
+            app_start[..=num_app].copy_from_slice(app_start_raw);
+            AppManager {
+                num_app,
+                current_app: 0,
+                app_start,
+            }
+        })
+    };
+}
+
+/// init batch subsystem
+pub fn init() {
+    print_app_info();
+}
+
+/// print apps info
+pub fn print_app_info() {
+    APP_MANAGER.exclusive_access().print_app_info();
+}
+
+/// run next app
+pub fn run_next_app() -> ! {
+    let mut app_manager = APP_MANAGER.exclusive_access();
+    let current_app = app_manager.get_current_app();
+    unsafe {
+        app_manager.load_app(current_app);
+    }
+    app_manager.move_to_next_app();
+    drop(app_manager);
+    // before this we have to drop local variables related to resources manually
+    // and release the resources
+    extern "C" {
+        fn __restore(cx_addr: usize);
+    }
+    unsafe {
+        __restore(KERNEL_STACK.push_context(TrapContext::app_init_context(
+            APP_BASE_ADDRESS,
+            USER_STACK.get_sp(),
+        )) as *const _ as usize);
+    }
+    panic!("Unreachable in batch::run_current_app!");
+}
+</file>
+
+<file path="os/src/config.rs">
+//! Constants in the kernel
+
+#[allow(unused)]
+
+/// user app's stack size
+pub const USER_STACK_SIZE: usize = 4096 * 2;
+/// kernel stack size
+pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
+/// kernel heap size
+pub const KERNEL_HEAP_SIZE: usize = 0x200_0000;
+
+/// page size : 4KB
+pub const PAGE_SIZE: usize = 0x1000;
+/// page size bits: 12
+pub const PAGE_SIZE_BITS: usize = 0xc;
+/// the max number of syscall
+pub const MAX_SYSCALL_NUM: usize = 500;
+/// the virtual addr of trapoline
+pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
+/// the virtual addr of trap context
+pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+/// clock frequency
+pub const CLOCK_FREQ: usize = 12500000;
+/// the physical memory end
+pub const MEMORY_END: usize = 0x88000000;
+</file>
+
+<file path="os/src/console.rs">
+//! SBI console driver, for text output
+use crate::sbi::console_putchar;
+use core::fmt::{self, Write};
+
+struct Stdout;
+
+impl Write for Stdout {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            console_putchar(c as usize);
+        }
+        Ok(())
+    }
+}
+
+pub fn print(args: fmt::Arguments) {
+    Stdout.write_fmt(args).unwrap();
+}
+
+/// Print! to the host console using the format string and arguments.
+#[macro_export]
+macro_rules! print {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::console::print(format_args!($fmt $(, $($arg)+)?))
+    }
+}
+
+/// Println! to the host console using the format string and arguments.
+#[macro_export]
+macro_rules! println {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::console::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?))
+    }
+}
+</file>
+
+<file path="os/src/entry.asm">
+.section .text.entry
+    .globl _start
+_start:
+    la sp, boot_stack_top
+    call rust_main
+
+    .section .bss.stack
+    .globl boot_stack_lower_bound
+boot_stack_lower_bound:
+    .space 4096 * 16
+    .globl boot_stack_top
+boot_stack_top:
+</file>
+
+<file path="os/src/heap_alloc.rs">
+//! The global allocator
+
+use crate::config::KERNEL_HEAP_SIZE;
+use buddy_system_allocator::LockedHeap;
+
+#[global_allocator]
+/// heap allocator instance
+static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// heap space ([u8; KERNEL_HEAP_SIZE])
+static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
+
+/// initiate heap allocator
+pub fn init_heap() {
+    unsafe {
+        HEAP_ALLOCATOR
+            .lock()
+            .init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
+    }
+}
+
+#[alloc_error_handler]
+/// panic when heap allocation error occurs
+pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+    panic!("Heap allocation error, layout = {:?}", layout);
+}
+</file>
+
+<file path="os/src/lang_items.rs">
+//! The panic handler
+
+use crate::sbi::shutdown;
+use core::panic::PanicInfo;
+
+#[panic_handler]
+/// panic handler
+fn panic(info: &PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        println!(
+            "[kernel] Panicked at {}:{} {}",
+            location.file(),
+            location.line(),
+            info.message().unwrap()
+        );
+    } else {
+        println!("[kernel] Panicked: {}", info.message().unwrap());
+    }
+    shutdown()
+}
+</file>
+
+<file path="os/src/linker.ld">
+OUTPUT_ARCH(riscv)
+ENTRY(_start)
+BASE_ADDRESS = 0x80200000;
+
+SECTIONS
+{
+    . = BASE_ADDRESS;
+    skernel = .;
+
+    stext = .;
+    .text : {
+        *(.text.entry)
+        . = ALIGN(4K);
+        strampoline = .;
+        *(.text.trampoline);
+        . = ALIGN(4K);
+        *(.text .text.*)
+    }
+
+    . = ALIGN(4K);
+    etext = .;
+    srodata = .;
+    .rodata : {
+        *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+    }
+
+    . = ALIGN(4K);
+    erodata = .;
+    sdata = .;
+    .data : {
+        *(.data .data.*)
+        *(.sdata .sdata.*)
+    }
+
+    . = ALIGN(4K);
+    edata = .;
+    sbss_with_stack = .;
+    .bss : {
+        *(.bss.stack)
+        sbss = .;
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+    }
+
+    . = ALIGN(4K);
+    ebss = .;
+    ekernel = .;
+
+    /DISCARD/ : {
+        *(.eh_frame)
+    }
+}
+</file>
+
+<file path="os/src/loader.rs">
+//! Loading user applications into memory
+
+/// Get the total number of applications.
+pub fn get_num_app() -> usize {
+    extern "C" {
+        fn _num_app();
+    }
+    unsafe { (_num_app as usize as *const usize).read_volatile() }
+}
+
+/// get applications data
+pub fn get_app_data(app_id: usize) -> &'static [u8] {
+    extern "C" {
+        fn _num_app();
+    }
+    let num_app_ptr = _num_app as usize as *const usize;
+    let num_app = get_num_app();
+    let app_start = unsafe { core::slice::from_raw_parts(num_app_ptr.add(1), num_app + 1) };
+    assert!(app_id < num_app);
+    unsafe {
+        core::slice::from_raw_parts(
+            app_start[app_id] as *const u8,
+            app_start[app_id + 1] - app_start[app_id],
+        )
+    }
+}
+</file>
+
+<file path="os/src/logging.rs">
+//! Global logger
+
+use log::{Level, LevelFilter, Log, Metadata, Record};
+
+/// a simple logger
+struct SimpleLogger;
+
+impl Log for SimpleLogger {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let color = match record.level() {
+            Level::Error => 31, // Red
+            Level::Warn => 93,  // BrightYellow
+            Level::Info => 34,  // Blue
+            Level::Debug => 32, // Green
+            Level::Trace => 90, // BrightBlack
+        };
+        println!(
+            "\u{1B}[{}m[{:>5}] {}\u{1B}[0m",
+            color,
+            record.level(),
+            record.args(),
+        );
+    }
+    fn flush(&self) {}
+}
+
+/// initiate logger
+pub fn init() {
+    static LOGGER: SimpleLogger = SimpleLogger;
+    log::set_logger(&LOGGER).unwrap();
+    log::set_max_level(match option_env!("LOG") {
+        Some("ERROR") => LevelFilter::Error,
+        Some("WARN") => LevelFilter::Warn,
+        Some("INFO") => LevelFilter::Info,
+        Some("DEBUG") => LevelFilter::Debug,
+        Some("TRACE") => LevelFilter::Trace,
+        _ => LevelFilter::Off,
+    });
+}
+</file>
+
+<file path="os/src/main.rs">
+//! The main module and entrypoint
+//!
+//! Various facilities of the kernels are implemented as submodules. The most
+//! important ones are:
+//!
+//! - [`trap`]: Handles all cases of switching from userspace to the kernel
+//! - [`task`]: Task management
+//! - [`syscall`]: System call handling and implementation
+//!
+//! The operating system also starts in this module. Kernel code starts
+//! executing from `entry.asm`, after which [`rust_main()`] is called to
+//! initialize various pieces of functionality. (See its source code for
+//! details.)
+//!
+//! We then call [`task::run_first_task()`] and for the first time go to
+//! userspace.
+
+#![deny(missing_docs)]
+#![deny(warnings)]
+#![no_std]
+#![no_main]
+#![feature(panic_info_message)]
+#![feature(alloc_error_handler)]
+
+#[macro_use]
+extern crate bitflags;
+#[macro_use]
+extern crate log;
+
+extern crate alloc;
+
+#[macro_use]
+mod console;
+pub mod config;
+pub mod lang_items;
+mod loader;
+pub mod logging;
+pub mod mm;
+pub mod sbi;
+pub mod sync;
+pub mod syscall;
+pub mod task;
+pub mod timer;
+pub mod trap;
+
+core::arch::global_asm!(include_str!("entry.asm"));
+core::arch::global_asm!(include_str!("link_app.S"));
+
+/// clear BSS segment
+fn clear_bss() {
+    extern "C" {
+        fn sbss();
+        fn ebss();
+    }
+    unsafe {
+        core::slice::from_raw_parts_mut(sbss as usize as *mut u8, ebss as usize - sbss as usize)
+            .fill(0);
+    }
+}
+
+/// kernel log info
+fn kernel_log_info() {
+    extern "C" {
+        fn stext(); // begin addr of text segment
+        fn etext(); // end addr of text segment
+        fn srodata(); // start addr of Read-Only data segment
+        fn erodata(); // end addr of Read-Only data ssegment
+        fn sdata(); // start addr of data segment
+        fn edata(); // end addr of data segment
+        fn sbss(); // start addr of BSS segment
+        fn ebss(); // end addr of BSS segment
+        fn boot_stack_lower_bound(); // stack lower bound
+        fn boot_stack_top(); // stack top
+    }
+    logging::init();
+    println!("[kernel] Hello, world!");
+    trace!(
+        "[kernel] .text [{:#x}, {:#x})",
+        stext as usize,
+        etext as usize
+    );
+    debug!(
+        "[kernel] .rodata [{:#x}, {:#x})",
+        srodata as usize, erodata as usize
+    );
+    info!(
+        "[kernel] .data [{:#x}, {:#x})",
+        sdata as usize, edata as usize
+    );
+    warn!(
+        "[kernel] boot_stack top=bottom={:#x}, lower_bound={:#x}",
+        boot_stack_top as usize, boot_stack_lower_bound as usize
+    );
+    error!("[kernel] .bss [{:#x}, {:#x})", sbss as usize, ebss as usize);
+}
+
+#[no_mangle]
+/// the rust entry-point of os
+pub fn rust_main() -> ! {
+    clear_bss();
+    kernel_log_info();
+    mm::init();
+    println!("[kernel] back to world!");
+    mm::remap_test();
+    trap::init();
+    trap::enable_timer_interrupt();
+    timer::set_next_trigger();
+    task::run_first_task();
+    panic!("Unreachable in rust_main!");
+}
+</file>
+
+<file path="os/src/sbi.rs">
+//! SBI call wrappers
+
+use core::arch::asm;
+
+const SBI_SET_TIMER: usize = 0;
+const SBI_CONSOLE_PUTCHAR: usize = 1;
+const SBI_SHUTDOWN: usize = 8;
+
+/// general sbi call
+#[inline(always)]
+fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
+    let mut ret;
+    unsafe {
+        asm!(
+
+            "ecall",
+            inlateout("x10") arg0 => ret,
+            in("x11") arg1,
+            in("x12") arg2,
+            in("x16") 0,
+            in("x17") which,
+        );
+    }
+    ret
+}
+
+/// use sbi call to set timer
+pub fn set_timer(timer: usize) {
+    sbi_call(SBI_SET_TIMER, timer, 0, 0);
+}
+
+/// use sbi call to putchar in console (qemu uart handler)
+pub fn console_putchar(c: usize) {
+    sbi_call(SBI_CONSOLE_PUTCHAR, c, 0, 0);
+}
+
+/// use sbi call to shutdown the kernel
+pub fn shutdown() -> ! {
+    sbi_call(SBI_SHUTDOWN, 0, 0, 0);
+    panic!("It should shutdown!");
+}
+</file>
+
+<file path="os/src/timer.rs">
+//! RISC-V timer-related functionality
+
+use crate::config::CLOCK_FREQ;
+use crate::sbi::set_timer;
+use riscv::register::time;
+/// The number of ticks per second
+const TICKS_PER_SEC: usize = 100;
+#[allow(dead_code)]
+/// The number of milliseconds per second
+const MSEC_PER_SEC: usize = 1000;
+/// The number of microseconds per second
+#[allow(dead_code)]
+const MICRO_PER_SEC: usize = 1_000_000;
+
+/// Get the current time in ticks
+pub fn get_time() -> usize {
+    time::read()
+}
+
+/// get current time in milliseconds
+#[allow(dead_code)]
+pub fn get_time_ms() -> usize {
+    time::read() * MSEC_PER_SEC / CLOCK_FREQ
+}
+
+/// get current time in microseconds
+#[allow(dead_code)]
+pub fn get_time_us() -> usize {
+    time::read() * MICRO_PER_SEC / CLOCK_FREQ
+}
+
+/// Set the next timer interrupt
+pub fn set_next_trigger() {
+    set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
+}
+</file>
+
+<file path="os/build.rs">
+//! Building applications linker
+
+use std::fs::{read_dir, File};
+use std::io::{Result, Write};
+
+fn main() {
+    println!("cargo:rerun-if-changed=../user/src/");
+    println!("cargo:rerun-if-changed={}", TARGET_PATH);
+    insert_app_data().unwrap();
+}
+
+static TARGET_PATH: &str = "../user/build/elf/";
+
+/// get app data and build linker
+fn insert_app_data() -> Result<()> {
+    let mut f = File::create("src/link_app.S").unwrap();
+    let mut apps: Vec<_> = read_dir("../user/build/elf/")
+        .unwrap()
+        .into_iter()
+        .map(|dir_entry| {
+            let mut name_with_ext = dir_entry.unwrap().file_name().into_string().unwrap();
+            name_with_ext.drain(name_with_ext.find('.').unwrap()..name_with_ext.len());
+            name_with_ext
+        })
+        .collect();
+    apps.sort();
+
+    writeln!(
+        f,
+        r#"
+    .align 3
+    .section .data
+    .global _num_app
+_num_app:
+    .quad {}"#,
+        apps.len()
+    )?;
+
+    for i in 0..apps.len() {
+        writeln!(f, r#"    .quad app_{}_start"#, i)?;
+    }
+    writeln!(f, r#"    .quad app_{}_end"#, apps.len() - 1)?;
+
+    for (idx, app) in apps.iter().enumerate() {
+        println!("app_{}: {}", idx, app);
+        writeln!(
+            f,
+            r#"
+    .section .data
+    .global app_{0}_start
+    .global app_{0}_end
+    .align 3
+app_{0}_start:
+    .incbin "{2}{1}.elf"
+app_{0}_end:"#,
+            idx, app, TARGET_PATH
+        )?;
+    }
+    Ok(())
+}
+</file>
+
+<file path="os/Cargo.toml">
+[package]
+name = "os"
+version = "0.1.0"
+authors = ["Yifan Wu <shinbokuow@163.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitflags = "1.2.1"
+buddy_system_allocator = "0.6"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+log = "0.4"
+riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
+xmas-elf = "0.7.0"
+</file>
+
+<file path="os/Makefile">
+# Building
+TARGET := riscv64gc-unknown-none-elf
+MODE := release
+KERNEL_ELF := target/$(TARGET)/$(MODE)/os
+KERNEL_BIN := $(KERNEL_ELF).bin
+DISASM_TMP := target/$(TARGET)/$(MODE)/asm
+OFFLINE :=
+
+# BOARD
+BOARD := qemu
+SBI ?= rustsbi
+BOOTLOADER := ../bootloader/$(SBI)-$(BOARD).bin
+
+# Building mode argument
+ifeq ($(MODE), release)
+	MODE_ARG := --release
+endif
+
+# KERNEL ENTRY
+KERNEL_ENTRY_PA := 0x80200000
+
+# Binutils
+OBJDUMP := rust-objdump --arch-name=riscv64
+OBJCOPY := rust-objcopy --binary-architecture=riscv64
+
+CHAPTER ?= $(shell git rev-parse --abbrev-ref HEAD | sed -E 's/ch([0-9])/\1/')
+TEST ?= $(CHAPTER)
+BASE ?= 1
+
+# Disassembly
+DISASM ?= -x
+
+build: env $(KERNEL_BIN)
+
+env:
+ifeq ($(OFFLINE),)
+	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
+	cargo install cargo-binutils --locked
+	rustup component add rust-src
+	rustup component add llvm-tools-preview
+endif
+
+$(KERNEL_BIN): kernel
+	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
+
+kernel:
+	@make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@echo Platform: $(BOARD)
+	@cargo build $(MODE_ARG)
+
+clean:
+	@cargo clean
+
+disasm: kernel
+	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less
+
+disasm-vim: kernel
+	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) > $(DISASM_TMP)
+	@vim $(DISASM_TMP)
+	@rm $(DISASM_TMP)
+
+run: run-inner
+
+run-inner: build
+	@qemu-system-riscv64 \
+		-machine virt \
+		-nographic \
+		-bios $(BOOTLOADER) \
+		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA)
+
+debug: build
+	@tmux new-session -d \
+		"qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
+		tmux -2 attach-session -d
+
+gdbserver: build
+	@qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S
+
+gdbclient:
+	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
+
+.PHONY: build env kernel clean disasm disasm-vim run-inner gdbserver gdbclient
+</file>
+
+<file path=".dockerignore">
+*/*
+</file>
+
+<file path=".gitignore">
+.*/*
+.merge_chain_state
+!.github/*
+!.vscode/settings.json
+.idea
+Cargo.lock
+target
+os/src/link_app.S
+os/last-*
+os/Cargo.lock
+os/.gdb_history
+easy-fs/Cargo.lock
+easy-fs/target/*
+easy-fs-fuse/Cargo.lock
+easy-fs-fuse/target/*
+tools/
+pushall.sh
+*.bak
+
+ci-user/
+os/vendor/
+user/
+</file>
+
+<file path="Dockerfile">
+# Reconstructed Dockerfile from docker history
+# Base image: Ubuntu 22.04
+FROM ubuntu:22.04
+
+# Build arguments
+ARG RELEASE
+ARG LAUNCHPAD_BUILD_ARCH
+ARG QEMU_VERSION=7.0.0
+ARG HOME=/root
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install basic tools
+RUN apt-get update && \
+    apt-get install -y \
+    curl \
+    git \
+    python3 \
+    wget \
+    xz-utils
+
+# Set working directory
+WORKDIR /root
+
+# Download and extract QEMU
+RUN wget https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz && \
+    tar xvJf qemu-${QEMU_VERSION}.tar.xz
+
+# Install QEMU build dependencies
+RUN apt-get install -y \
+    autoconf automake autotools-dev curl libmpc-dev libmpfr-dev libgmp-dev \
+    gawk build-essential bison flex texinfo gperf libtool patchutils bc \
+    zlib1g-dev libexpat-dev git \
+    ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev
+
+# Build and install QEMU
+WORKDIR /root/qemu-7.0.0
+RUN ./configure --target-list=riscv64-softmmu,riscv64-linux-user && \
+    make -j$(nproc) && \
+    make install
+
+# Clean up QEMU build files
+WORKDIR /root
+RUN rm -rf qemu-${QEMU_VERSION} qemu-${QEMU_VERSION}.tar.xz
+
+# Verify QEMU installation
+RUN qemu-system-riscv64 --version && \
+    qemu-riscv64 --version
+
+# Set up Rust environment
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    RUST_VERSION=nightly
+
+# Install Rust
+RUN set -eux; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init; \
+    chmod +x rustup-init; \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION; \
+    rm rustup-init; \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME;
+
+# Verify Rust installation
+RUN rustup --version && \
+    cargo --version && \
+    rustc --version
+
+# 2.3 Env
+RUN cargo install cargo-binutils; \
+    rustup target add riscv64gc-unknown-none-elf; \
+    rustup component add rust-src; \
+    rustup component add llvm-tools-preview; \
+    rustup component add rustfmt; \
+    rustup component add clippy;
+
+
+# Install Rust components and tools for rCore development
+RUN rustup default $RUST_VERSION; \
+    cargo install cargo-binutils; \
+    rustup target add riscv64gc-unknown-none-elf; \
+    rustup component add rust-src; \
+    rustup component add llvm-tools-preview; \
+    rustup component add rustfmt; \
+    rustup component add clippy;
+
+# Set working directory
+WORKDIR /root
+
+# Default command
+CMD ["/bin/bash"]
+</file>
+
+<file path="LICENSE">
+GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+the GNU General Public License is intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.  We, the Free Software Foundation, use the
+GNU General Public License for most of our software; it applies also to
+any other work released this way by its authors.  You can apply it to
+your programs, too.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  To protect your rights, we need to prevent others from denying you
+these rights or asking you to surrender the rights.  Therefore, you have
+certain responsibilities if you distribute copies of the software, or if
+you modify it: responsibilities to respect the freedom of others.
+
+  For example, if you distribute copies of such a program, whether
+gratis or for a fee, you must pass on to the recipients the same
+freedoms that you received.  You must make sure that they, too, receive
+or can get the source code.  And you must show them these terms so they
+know their rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the developers' and authors' protection, the GPL clearly explains
+that there is no warranty for this free software.  For both users' and
+authors' sake, the GPL requires that modified versions be marked as
+changed, so that their problems will not be attributed erroneously to
+authors of previous versions.
+
+  Some devices are designed to deny users access to install or run
+modified versions of the software inside them, although the manufacturer
+can do so.  This is fundamentally incompatible with the aim of
+protecting users' freedom to change the software.  The systematic
+pattern of such abuse occurs in the area of products for individuals to
+use, which is precisely where it is most unacceptable.  Therefore, we
+have designed this version of the GPL to prohibit the practice for those
+products.  If such problems arise substantially in other domains, we
+stand ready to extend this provision to those domains in future versions
+of the GPL, as needed to protect the freedom of users.
+
+  Finally, every program is threatened constantly by software patents.
+States should not allow patents to restrict development and use of
+software on general-purpose computers, but in those that do, we wish to
+avoid the special danger that patents applied to a free program could
+make it effectively proprietary.  To prevent this, the GPL assures that
+patents cannot be used to render the program non-free.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Use with the GNU Affero General Public License.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU Affero General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the special requirements of the GNU Affero General Public License,
+section 13, concerning interaction through a network will apply to the
+combination as such.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU General Public License from time to time.  Such new versions will
+be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If the program does terminal interaction, make it output a short
+notice like this when it starts in an interactive mode:
+
+    <program>  Copyright (C) <year>  <name of author>
+    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+    This is free software, and you are welcome to redistribute it
+    under certain conditions; type `show c' for details.
+
+The hypothetical commands `show w' and `show c' should show the appropriate
+parts of the General Public License.  Of course, your program's commands
+might be different; for a GUI interface, you would use an "about box".
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU GPL, see
+<https://www.gnu.org/licenses/>.
+
+  The GNU General Public License does not permit incorporating your program
+into proprietary programs.  If your program is a subroutine library, you
+may consider it more useful to permit linking proprietary applications with
+the library.  If this is what you want to do, use the GNU Lesser General
+Public License instead of this License.  But first, please read
+<https://www.gnu.org/licenses/why-not-lgpl.html>.
+</file>
+
+<file path="Makefile">
+CONTAINER_NAME ?= rcore-container
+DOCKER_NAME ?= rcore-docker
+.PHONY: docker build_docker attach_docker rebuild_docker fmt
+
+docker:
+	if ! docker images --format "{{.Repository}}" | grep -q "^${DOCKER_NAME}$$"; then \
+		echo "❌ image '${DOCKER_NAME}' not exits，start building..."; \
+		make build_docker; \
+	else \
+		echo "✅ image '${DOCKER_NAME}' was built, skip building..."; \
+	fi; \
+	if docker ps -a --filter "name=^/${CONTAINER_NAME}$$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then \
+		echo "✅ find existing container: ${CONTAINER_NAME}，accessing..."; \
+		if ! docker ps --filter "name=^/${CONTAINER_NAME}$$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then \
+			echo "🔧 container isn't running，start launching..."; \
+			docker start ${CONTAINER_NAME}; \
+		fi; \
+		docker exec -it ${CONTAINER_NAME} bash; \
+	else \
+		echo "🚀 no existing container is found: ${CONTAINER_NAME}，start creating new container..."; \
+		docker run --network host -it -d \
+			--name ${CONTAINER_NAME} \
+			-v ${CURDIR}:/mnt \
+			-w /mnt \
+			${DOCKER_NAME} \
+			bash; \
+		docker exec -it ${CONTAINER_NAME} bash; \
+	fi
+
+# build docker if container doesn't exist
+build_docker:
+	docker build -t ${DOCKER_NAME} .
+
+attach_docker:
+	@if docker ps -a --filter "name=^/${CONTAINER_NAME}$$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then \
+		if ! docker ps --filter "name=^/${CONTAINER_NAME}$$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then \
+			docker start ${CONTAINER_NAME}; \
+		fi; \
+		docker exec -it ${CONTAINER_NAME} bash; \
+	else \
+		echo "❌ no existing container is found: ${CONTAINER_NAME}，please run 'make docker' to create container"; \
+	fi
+
+rebuild_docker:
+	@echo "🗑️ delete existing container ${CONTAINER_NAME}..."; \
+	docker rm -f ${CONTAINER_NAME} 2>/dev/null; \
+	echo "🚀 start creating container..."; \
+	docker run --network host -it -d \
+		--name ${CONTAINER_NAME} \
+		-v ${CURDIR}:/mnt \
+		-w /mnt \
+		${DOCKER_NAME} \
+		bash; \
+	docker exec -it ${CONTAINER_NAME} bash;
+
+fmt:
+	cd os ; cargo fmt; cd ..
+</file>
+
+<file path="merge_chain.sh">
+#!/bin/bash
+set -euo pipefail
+
+STATE_FILE=".merge_chain_state"
+
+usage() {
+    echo "Usage:"
+    echo "  $0 start <start_branch_id> <end_branch_id>   # Start merging"
+    echo "  $0 continue                                 # Continue interrupted merge"
+    echo "  $0 abort                                    # Abort interrupted merge"
+    echo "  $0 status                                   # Check current merge status"
+    echo "  $0 sync <start_branch_id> <end_branch_id>    # Sync branches from remote"
+    echo "  $0 push <remote> <start_branch_id> <end_branch_id>  # Push local branches to remote"
+    echo "  $0 help                                     # Show detailed help information"
+    echo ""
+    echo "Examples:"
+    echo "  $0 sync 1 8       # Sync ch1 to ch8 from remote (for new clones)"
+    echo "  $0 start 3 8      # Start merging from ch3 to ch8"
+    echo "  $0 push origin 3 8     # Push ch3 to ch8 to origin remote"
+    echo "  $0 push upstream 3 8   # Push ch3 to ch8 to upstream remote"
+    echo "  $0 status         # Check current merge progress"
+    echo "  $0 continue       # Continue merge after resolving conflicts"
+    echo ""
+    echo "Merge message format: 'Merge ch{source} to ch{target}: {original message}'"
+    exit 1
+}
+
+show_help() {
+    echo "Git Branch Chain Merge Tool"
+    echo "==========================="
+    echo ""
+    echo "This tool maintains linear commit relationships across multiple branches."
+    echo "When you commit to branch k, it automatically merges that commit to all"
+    echo "branches with numbers greater than k."
+    echo ""
+    echo "Command descriptions:"
+    echo "  start <start_id> <end_id>  Start chain merge from ch<start_id> to ch<end_id>"
+    echo "  continue                   Continue interrupted merge process"
+    echo "  abort                      Abort current merge process"
+    echo "  status                     Show current merge status and progress"
+    echo "  sync <start_id> <end_id>   Sync local branches from remote (for new clones)"
+    echo "  push <remote> <start_id> <end_id>  Push local branches to specified remote"
+    echo "  help                       Show this help information"
+    echo ""
+    echo "Git Operations done by the tool:"
+    echo "  For each target branch (start+1, start+2, ..., end):"
+    echo "  1. git checkout ch{target}                # Switch to target branch"
+    echo "  2. git merge ch{source} -m \"Merge...\"    # Merge with custom message"
+    echo "  3. If conflict: save state and exit for manual resolution"
+    echo "  4. If success: continue to next branch"
+    echo ""
+    echo "Workflow:"
+    echo "  For newly cloned repositories:"
+    echo "  0. Run '$0 sync 1 8' to create local branches from remote"
+    echo ""
+    echo "  Normal workflow:"
+    echo "  1. Commit code to a branch (e.g., ch3)"
+    echo "  2. Run '$0 start 3 8' to start merging"
+    echo "  3. If conflicts occur, resolve manually and run '$0 continue'"
+    echo "  4. Repeat step 3 until all branches are merged"
+    echo "  5. Run '$0 push origin 3 8' to push all merged branches to remote"
+    echo ""
+    echo "Conflict Resolution (when merge fails):"
+    echo "  1. Edit conflicted files manually"
+    echo "  2. Stage resolved files with 'git add'"
+    echo "  3. Complete the merge commit with 'git merge --continue'"
+    echo "  4. Execute '$0 continue' to resume chain merge process"
+    echo ""
+    echo "Merge message format:"
+    echo "  'Merge ch{source} to ch{target}: {original commit message}'"
+    echo ""
+    echo "  Where:"
+    echo "    - source: Previous branch number (e.g., ch3)"
+    echo "    - target: Current branch number (e.g., ch4)" 
+    echo "    - original commit message: The commit message from the starting branch"
+    echo ""
+    echo "  Example: 'Merge ch3 to ch4: Add user authentication feature'"
+    echo ""
+    echo "State file:"
+    echo "  Creates '.merge_chain_state' file to save progress during merge"
+    echo "  Automatically deleted when merge completes or is aborted"
+    echo ""
+    exit 0
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+COMMAND=$1
+
+case "$COMMAND" in
+    start)
+        if [[ $# -ne 3 ]]; then usage; fi
+        START_BRANCH=$2
+        END_BRANCH=$3
+        
+        # Validate branch numbers
+        if [[ ! $START_BRANCH =~ ^[0-9]+$ ]] || [[ ! $END_BRANCH =~ ^[0-9]+$ ]]; then
+            echo "Error: Branch numbers must be numeric"
+            exit 1
+        fi
+        
+        if [[ $START_BRANCH -ge $END_BRANCH ]]; then
+            echo "Error: Start branch number must be less than end branch number"
+            exit 1
+        fi
+        
+        
+        # Check if all required branches exist locally
+        echo "Checking required branches..."
+        for ((branch_num=START_BRANCH; branch_num<=END_BRANCH; branch_num++)); do
+            branch_name="ch${branch_num}"
+            
+            # Check if local branch exists
+            if ! git show-ref --verify --quiet refs/heads/${branch_name}; then
+                echo ""
+                echo "❌ Error: Local branch ${branch_name} does not exist"
+                echo "💡 Solution: Run the following command to sync branches from remote:"
+                echo "   $0 sync ${START_BRANCH} ${END_BRANCH}"
+                echo ""
+                echo "This will create local branches from the remote repository."
+                exit 1
+            else
+                echo "Local branch ${branch_name} exists"
+            fi
+        done
+        
+        # Check for incomplete merge
+        if [[ -f "$STATE_FILE" ]]; then
+            echo "Error: Incomplete merge process exists, please run '$0 continue' or '$0 abort' first"
+            exit 1
+        fi
+        
+        NEXT_BRANCH=$((START_BRANCH + 1))
+        # Get the latest commit message from the first branch
+        ORIGIN_MSG=$(git log -1 --pretty=%B ch${START_BRANCH})
+        echo "Starting chain merge: ch${START_BRANCH} -> ch${END_BRANCH}"
+        echo "Original commit message: $ORIGIN_MSG"
+        ;;
+
+    continue)
+        if [[ ! -f "$STATE_FILE" ]]; then
+            echo "No interrupted state found, cannot continue."
+            exit 1
+        fi
+        { read -r START_BRANCH; read -r END_BRANCH; read -r NEXT_BRANCH; read -r ORIGIN_MSG; } < "$STATE_FILE"
+        echo "Continuing interrupted merge from ch$NEXT_BRANCH..."
+        ;;
+
+    abort)
+        if [[ -f "$STATE_FILE" ]]; then
+            rm "$STATE_FILE"
+            echo "Interrupted merge has been aborted."
+        else
+            echo "No interrupted state found, nothing to abort."
+        fi
+        exit 0
+        ;;
+
+    status)
+        if [[ -f "$STATE_FILE" ]]; then
+            { read -r START_BRANCH; read -r END_BRANCH; read -r NEXT_BRANCH; read -r ORIGIN_MSG; } < "$STATE_FILE"
+            echo "Merge status: In progress"
+            echo "Start branch: ch${START_BRANCH}"
+            echo "End branch: ch${END_BRANCH}"
+            echo "Original message: $ORIGIN_MSG"
+            echo "Current progress: Preparing to merge to ch${NEXT_BRANCH}"
+            echo "Remaining branches: $((END_BRANCH - NEXT_BRANCH + 1))"
+            
+            # Show completed branches
+            if [[ $NEXT_BRANCH -gt $((START_BRANCH + 1)) ]]; then
+                echo "Completed: ch${START_BRANCH} -> ch$((NEXT_BRANCH - 1))"
+            fi
+            
+            # Show pending branches
+            if [[ $NEXT_BRANCH -le $END_BRANCH ]]; then
+                echo "Pending: ch${NEXT_BRANCH} -> ch${END_BRANCH}"
+            fi
+        else
+            echo "Merge status: No merge in progress"
+            echo "Current branch: $(git branch --show-current)"
+        fi
+        exit 0
+        ;;
+
+    sync)
+        if [[ $# -ne 3 ]]; then usage; fi
+        SYNC_START=$2
+        SYNC_END=$3
+        
+        # Validate branch numbers
+        if [[ ! $SYNC_START =~ ^[0-9]+$ ]] || [[ ! $SYNC_END =~ ^[0-9]+$ ]]; then
+            echo "Error: Branch numbers must be numeric"
+            exit 1
+        fi
+        
+        if [[ $SYNC_START -gt $SYNC_END ]]; then
+            echo "Error: Start branch number must be less than or equal to end branch number"
+            exit 1
+        fi
+        
+        # Fetch remote branches
+        echo "Fetching remote branch information..."
+        if ! git fetch origin --quiet; then
+            echo "Error: Failed to fetch from remote repository"
+            exit 1
+        fi
+        
+        # Sync branches
+        echo "Syncing branches ch${SYNC_START} to ch${SYNC_END}..."
+        for ((branch_num=SYNC_START; branch_num<=SYNC_END; branch_num++)); do
+            branch_name="ch${branch_num}"
+            
+            if ! git show-ref --verify --quiet refs/heads/${branch_name}; then
+                if git show-ref --verify --quiet refs/remotes/origin/${branch_name}; then
+                    echo "Creating local branch ${branch_name} from origin/${branch_name}..."
+                    if ! git checkout -b ${branch_name} origin/${branch_name}; then
+                        echo "Error: Failed to create local branch ${branch_name}"
+                        exit 1
+                    fi
+                else
+                    echo "Warning: Remote branch origin/${branch_name} does not exist, skipping"
+                fi
+            else
+                echo "Local branch ${branch_name} already exists"
+            fi
+        done
+        
+        echo "Branch synchronization completed!"
+        exit 0
+        ;;
+
+    push)
+        if [[ $# -ne 4 ]]; then usage; fi
+        REMOTE=$2
+        PUSH_START=$3
+        PUSH_END=$4
+        
+        # Validate branch numbers
+        if [[ ! $PUSH_START =~ ^[0-9]+$ ]] || [[ ! $PUSH_END =~ ^[0-9]+$ ]]; then
+            echo "Error: Branch numbers must be numeric"
+            exit 1
+        fi
+        
+        if [[ $PUSH_START -gt $PUSH_END ]]; then
+            echo "Error: Start branch number must be less than or equal to end branch number"
+            exit 1
+        fi
+        
+        # Check for incomplete merge
+        if [[ -f "$STATE_FILE" ]]; then
+            echo "Warning: There is an incomplete merge process."
+            echo "Please run '$0 continue' or '$0 abort' before pushing."
+            exit 1
+        fi
+        
+        # Push branches
+        echo "Pushing branches ch${PUSH_START} to ch${PUSH_END} to remote '${REMOTE}'..."
+        FAILED_PUSHES=()
+        
+        for ((branch_num=PUSH_START; branch_num<=PUSH_END; branch_num++)); do
+            branch_name="ch${branch_num}"
+            
+            # Check if local branch exists
+            if ! git show-ref --verify --quiet refs/heads/${branch_name}; then
+                echo "❌ Warning: Local branch ${branch_name} does not exist, skipping"
+                FAILED_PUSHES+=("${branch_name} (not found)")
+                continue
+            fi
+            
+            echo "Pushing ${branch_name}..."
+            if git push ${REMOTE} ${branch_name}; then
+                echo "✅ Successfully pushed ${branch_name}"
+            else
+                echo "❌ Failed to push ${branch_name}"
+                FAILED_PUSHES+=("${branch_name} (push failed)")
+            fi
+        done
+        
+        echo ""
+        if [[ ${#FAILED_PUSHES[@]} -eq 0 ]]; then
+            echo "🎉 All branches pushed successfully!"
+        else
+            echo "⚠️ Push completed with some failures:"
+            for failure in "${FAILED_PUSHES[@]}"; do
+                echo "  - ${failure}"
+            done
+            echo ""
+            echo "Please check the failed branches and try again if needed."
+        fi
+        
+        exit 0
+        ;;
+
+    help)
+        show_help
+        ;;
+
+    *)
+        usage
+        ;;
+esac
+
+for ((i=NEXT_BRANCH; i<=END_BRANCH; i++)); do
+    CUR_BRANCH="ch${i}"
+    PREV_BRANCH="ch$((i-1))"
+    PROGRESS="[$((i-START_BRANCH))/$((END_BRANCH-START_BRANCH))]"
+
+    echo ""
+    echo "=== ${PROGRESS} Merging ${PREV_BRANCH} -> ${CUR_BRANCH} ==="
+    
+    # Check if target branch exists
+    if ! git show-ref --verify --quiet refs/heads/${CUR_BRANCH}; then
+        echo "Error: Branch ${CUR_BRANCH} does not exist"
+        printf '%s\n' "$START_BRANCH" "$END_BRANCH" "$i" "$ORIGIN_MSG" > "$STATE_FILE"
+        exit 1
+    fi
+    
+    echo "Switching to branch ${CUR_BRANCH}..."
+    if ! git checkout "${CUR_BRANCH}"; then
+        echo "Error: Cannot switch to branch ${CUR_BRANCH}"
+        printf '%s\n' "$START_BRANCH" "$END_BRANCH" "$i" "$ORIGIN_MSG" > "$STATE_FILE"
+        exit 1
+    fi
+
+    echo "Merging ${PREV_BRANCH}..."
+    if ! git merge "${PREV_BRANCH}" -m "Merge ${PREV_BRANCH} to ${CUR_BRANCH}: ${ORIGIN_MSG}"; then
+        echo ""
+        echo "❌ Conflict occurred in ${CUR_BRANCH}"
+        echo "Please follow these steps to resolve:"
+        echo "1. Manually resolve conflict files"
+        echo "2. Run 'git add .' to add resolved files"
+        echo "3. Run 'git commit' to commit the merge"
+        echo "4. Run '$0 continue' to continue the merge process"
+        echo ""
+        echo "Or run '$0 abort' to abort the merge"
+        echo "Or run '$0 status' to check current status"
+        printf '%s\n' "$START_BRANCH" "$END_BRANCH" "$i" "$ORIGIN_MSG" > "$STATE_FILE"
+        exit 1
+    fi
+    
+    echo "✅ Successfully merged to ${CUR_BRANCH}"
+done
+
+# Merge completed, delete state file
+[[ -f "$STATE_FILE" ]] && rm "$STATE_FILE"
+echo ""
+echo "🎉 All branches merged successfully!"
+echo "Merge range: ch${START_BRANCH} -> ch${END_BRANCH}"
+echo "Original commit: $ORIGIN_MSG"
+echo ""
+echo "💡 To push all merged branches to remote, run:"
+echo "   $0 push origin ${START_BRANCH} ${END_BRANCH}"
+</file>
+
+<file path="rust-toolchain.toml">
+[toolchain]
+profile = "minimal"
+# use the nightly version of the last stable toolchain, see <https://forge.rust-lang.org/>
+channel = "nightly-2024-05-02"
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
+</file>
+
+<file path="os/src/syscall/mod.rs">
+//! Implementation of syscalls
+//!
+//! The single entry point to all system calls, [`syscall()`], is called
+//! whenever userspace wishes to perform a system call using the `ecall`
+//! instruction. In this case, the processor raises an 'Environment call from
+//! U-mode' exception, which is handled as one of the cases in
+//! [`crate::trap::trap_handler`].
+//!
+//! For clarity, each single syscall is implemented as its own function, named
+//! `sys_` then the name of the syscall. You can find functions like this in
+//! submodules, and you should also implement syscalls this way.
+const SYSCALL_WRITE: usize = 64;
+/// exit syscall
+const SYSCALL_EXIT: usize = 93;
+/// yield syscall
+const SYSCALL_YIELD: usize = 124;
+/// gettime syscall
+const SYSCALL_GET_TIME: usize = 169;
+/// sbrk syscall
+const SYSCALL_SBRK: usize = 214;
+/// munmap syscall
+const SYSCALL_MUNMAP: usize = 215;
+/// mmap syscall
+const SYSCALL_MMAP: usize = 222;
+/// trace syscall
+const SYSCALL_TRACE: usize = 410;
+
+mod fs;
+mod process;
+
+use fs::*;
+use process::*;
+
+/// handle syscall exception with `syscall_id` and other arguments
+pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
+
+    crate::task::inc_syscall(syscall_id);
+
+    
+    match syscall_id {
+        SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_EXIT => sys_exit(args[0] as i32),
+        SYSCALL_YIELD => sys_yield(),
+        SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_TRACE => sys_trace(args[0], args[1], args[2]),
+        SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
+        SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_SBRK => sys_sbrk(args[0] as i32),
+        _ => panic!("Unsupported syscall_id: {}", syscall_id),
+    }
+}
+</file>
+
+<file path="os/src/syscall/process.rs">
+//! Process management syscalls
+
+use crate::mm::translated_byte_buffer;
+use crate::task::current_user_token;
+
+use crate::task::{change_program_brk, exit_current_and_run_next, suspend_current_and_run_next};
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct TimeVal {
+    pub sec: usize,
+    pub usec: usize,
+}
+
+/// task exits and submit an exit code
+pub fn sys_exit(_exit_code: i32) -> ! {
+    trace!("kernel: sys_exit");
+    exit_current_and_run_next();
+    panic!("Unreachable in sys_exit!");
+}
+
+/// current task gives up resources for other tasks
+pub fn sys_yield() -> isize {
+    trace!("kernel: sys_yield");
+    suspend_current_and_run_next();
+    0
+}
+
+/// YOUR JOB: get time with second and microsecond
+/// HINT: You might reimplement it with virtual memory management.
+/// HINT: What if [`TimeVal`] is splitted by two pages ?
+// pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+//     trace!("kernel: sys_get_time");
+//     -1
+// }
+
+ 
+
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = crate::timer::get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    
+    // 获取当前进程的页表 token
+    let token = current_user_token();
+    
+    // 将结构体转换为字节切片
+    let time_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const _ as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    
+    // 使用页表翻译并获取物理内存缓冲区的切片列表 (防止跨页)
+    let buffers = translated_byte_buffer(token, ts as *const u8, core::mem::size_of::<TimeVal>());
+    
+    // 逐个分发写入到对应的物理页中
+    let mut offset = 0;
+    for buffer in buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&time_bytes[offset..offset + len]);
+        offset += len;
+    }
+    0
+}
+
+/// TODO: Finish sys_trace to pass testcases
+/// HINT: You might reimplement it with virtual memory management.
+// pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+//     trace!("kernel: sys_trace");
+//     -1
+// }
+ 
+pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
+    match trace_request {
+        // 请求 0：读取内存（将虚拟地址 id 翻译为物理地址后读取 1 字节）
+        0 => {
+            let token = current_user_token();
+            let buffers = translated_byte_buffer(token, id as *const u8, 1);
+            buffers[0][0] as isize
+        },
+        // 请求 1：写入内存（将虚拟地址 id 翻译为物理地址后写入 1 字节）
+        1 => {
+            let token = current_user_token();
+            let mut buffers = translated_byte_buffer(token, id as *const u8, 1);
+            buffers[0][0] = data as u8;
+            0
+        },
+        // 请求 2：获取系统调用计数
+        2 => {
+            crate::task::get_current_syscall_times(id) as isize
+        },
+        _ => -1,
+    }
+}
+
+
+
+
+// // YOUR JOB: Implement mmap.
+// pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+//     trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
+//     -1
+// }
+
+// // YOUR JOB: Implement munmap.
+// pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+//     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
+//     -1
+// }
+
+///
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    crate::task::mmap_current(start, len, port)
+}
+///
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    crate::task::munmap_current(start, len)
+}
+
+
+/// change data segment size
+pub fn sys_sbrk(size: i32) -> isize {
+    trace!("kernel: sys_sbrk");
+    if let Some(old_brk) = change_program_brk(size) {
+        old_brk as isize
+    } else {
+        -1
+    }
+}
+</file>
+
+<file path="os/src/task/mod.rs">
+//! Task management implementation
+//!
+//! Everything about task management, like starting and switching tasks is
+//! implemented here.
+//!
+//! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
+//! all the tasks in the operating system.
+//!
+//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
+//! might not be what you expect.
+
+mod context;
+mod switch;
+#[allow(clippy::module_inception)]
+mod task;
+
+use crate::loader::{get_app_data, get_num_app};
+use crate::sync::UPSafeCell;
+use crate::trap::TrapContext;
+use alloc::vec::Vec;
+use lazy_static::*;
+use switch::__switch;
+pub use task::{TaskControlBlock, TaskStatus};
+
+pub use context::TaskContext;
+
+/// The task manager, where all the tasks are managed.
+///
+/// Functions implemented on `TaskManager` deals with all task state transitions
+/// and task context switching. For convenience, you can find wrappers around it
+/// in the module level.
+///
+/// Most of `TaskManager` are hidden behind the field `inner`, to defer
+/// borrowing checks to runtime. You can see examples on how to use `inner` in
+/// existing functions on `TaskManager`.
+pub struct TaskManager {
+    /// total number of tasks
+    num_app: usize,
+    /// use inner value to get mutable access
+    inner: UPSafeCell<TaskManagerInner>,
+}
+
+/// The task manager inner in 'UPSafeCell'
+struct TaskManagerInner {
+    /// task list
+    tasks: Vec<TaskControlBlock>,
+    /// id of current `Running` task
+    current_task: usize,
+}
+
+lazy_static! {
+    /// a `TaskManager` global instance through lazy_static!
+    pub static ref TASK_MANAGER: TaskManager = {
+        println!("init TASK_MANAGER");
+        let num_app = get_num_app();
+        println!("num_app = {}", num_app);
+        let mut tasks: Vec<TaskControlBlock> = Vec::new();
+        for i in 0..num_app {
+            tasks.push(TaskControlBlock::new(get_app_data(i), i));
+        }
+        TaskManager {
+            num_app,
+            inner: unsafe {
+                UPSafeCell::new(TaskManagerInner {
+                    tasks,
+                    current_task: 0,
+                })
+            },
+        }
+    };
+}
+
+impl TaskManager {
+    /// Run the first task in task list.
+    ///
+    /// Generally, the first task in task list is an idle task (we call it zero process later).
+    /// But in ch4, we load apps statically, so the first task is a real app.
+    fn run_first_task(&self) -> ! {
+        let mut inner = self.inner.exclusive_access();
+        let next_task = &mut inner.tasks[0];
+        next_task.task_status = TaskStatus::Running;
+        let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
+        drop(inner);
+        let mut _unused = TaskContext::zero_init();
+        // before this, we should drop local variables that must be dropped manually
+        unsafe {
+            __switch(&mut _unused as *mut _, next_task_cx_ptr);
+        }
+        panic!("unreachable in run_first_task!");
+    }
+
+    /// Change the status of current `Running` task into `Ready`.
+    fn mark_current_suspended(&self) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].task_status = TaskStatus::Ready;
+    }
+
+    /// Change the status of current `Running` task into `Exited`.
+    fn mark_current_exited(&self) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].task_status = TaskStatus::Exited;
+    }
+
+    /// Find next task to run and return task id.
+    ///
+    /// In this case, we only return the first `Ready` task in task list.
+    fn find_next_task(&self) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        (current + 1..current + self.num_app + 1)
+            .map(|id| id % self.num_app)
+            .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
+    }
+
+    /// Get the current 'Running' task's token.
+    fn get_current_token(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].get_user_token()
+    }
+
+    /// Get the current 'Running' task's trap contexts.
+    fn get_current_trap_cx(&self) -> &'static mut TrapContext {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].get_trap_cx()
+    }
+
+    /// Change the current 'Running' task's program break
+    pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].change_program_brk(size)
+    }
+
+    /// Switch current `Running` task to the task we have found,
+    /// or there is no `Ready` task and we can exit with all applications completed
+    fn run_next_task(&self) {
+        if let Some(next) = self.find_next_task() {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.tasks[next].task_status = TaskStatus::Running;
+            inner.current_task = next;
+            let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
+            let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            drop(inner);
+            // before this, we should drop local variables that must be dropped manually
+            unsafe {
+                __switch(current_task_cx_ptr, next_task_cx_ptr);
+            }
+            // go back to user mode
+        } else {
+            panic!("All applications completed!");
+        }
+    }
+}
+
+/// Run the first task in task list.
+pub fn run_first_task() {
+    TASK_MANAGER.run_first_task();
+}
+
+/// Switch current `Running` task to the task we have found,
+/// or there is no `Ready` task and we can exit with all applications completed
+fn run_next_task() {
+    TASK_MANAGER.run_next_task();
+}
+
+/// Change the status of current `Running` task into `Ready`.
+fn mark_current_suspended() {
+    TASK_MANAGER.mark_current_suspended();
+}
+
+/// Change the status of current `Running` task into `Exited`.
+fn mark_current_exited() {
+    TASK_MANAGER.mark_current_exited();
+}
+
+/// Suspend the current 'Running' task and run the next task in task list.
+pub fn suspend_current_and_run_next() {
+    mark_current_suspended();
+    run_next_task();
+}
+
+/// Exit the current 'Running' task and run the next task in task list.
+pub fn exit_current_and_run_next() {
+    mark_current_exited();
+    run_next_task();
+}
+
+/// Get the current 'Running' task's token.
+pub fn current_user_token() -> usize {
+    TASK_MANAGER.get_current_token()
+}
+
+/// Get the current 'Running' task's trap contexts.
+pub fn current_trap_cx() -> &'static mut TrapContext {
+    TASK_MANAGER.get_current_trap_cx()
+}
+
+/// Change the current 'Running' task's program break
+pub fn change_program_brk(size: i32) -> Option<usize> {
+    TASK_MANAGER.change_current_program_brk(size)
+}
+
+///
+pub fn inc_syscall(syscall_id: usize) {
+    if syscall_id < crate::task::task::MAX_SYSCALL_NUM {
+        // 根据你第四章的具体实现，可能是 current_task().unwrap().inner_exclusive_access() 
+        // 这里的代码取决于你 task 管理器的结构，最常见的是下面这种：
+        let mut inner = TASK_MANAGER.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+}
+///
+pub fn get_current_syscall_times(syscall_id: usize) -> u32 {
+    if syscall_id < crate::task::task::MAX_SYSCALL_NUM {
+        let inner = TASK_MANAGER.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id]
+    } else {
+        0
+    }
+}
+
+/// 处理当前任务的 mmap 映射
+pub fn mmap_current(start: usize, len: usize, port: usize) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.mmap(start, len, port)
+}
+
+/// 处理当前任务的 munmap 解除映射
+pub fn munmap_current(start: usize, len: usize) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.munmap(start, len)
+}
+</file>
+
+<file path="os/src/task/task.rs">
+//! Types related to task management
+use super::TaskContext;
+use crate::config::TRAP_CONTEXT_BASE;
+use crate::mm::{
+    kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
+};
+use crate::trap::{trap_handler, TrapContext};
+
+///
+pub const MAX_SYSCALL_NUM: usize = 500;
+
+/// The task control block (TCB) of a task.
+pub struct TaskControlBlock {
+    /// Save task context
+    pub task_cx: TaskContext,
+
+    /// Maintain the execution status of the current process
+    pub task_status: TaskStatus,
+
+    /// Application address space
+    pub memory_set: MemorySet,
+
+    /// The phys page number of trap context
+    pub trap_cx_ppn: PhysPageNum,
+
+    /// The size(top addr) of program which is loaded from elf file
+    pub base_size: usize,
+
+    /// Heap bottom
+    pub heap_bottom: usize,
+
+    /// Program break
+    pub program_brk: usize,
+
+    /// 记录当前任务的各个系统调用次数
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+
+}
+
+impl TaskControlBlock {
+    /// get the trap context
+    pub fn get_trap_cx(&self) -> &'static mut TrapContext {
+        self.trap_cx_ppn.get_mut()
+    }
+    /// get the user token
+    pub fn get_user_token(&self) -> usize {
+        self.memory_set.token()
+    }
+    /// Based on the elf info in program, build the contents of task in a new address space
+    pub fn new(elf_data: &[u8], app_id: usize) -> Self {
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let task_status = TaskStatus::Ready;
+        // map a kernel-stack in kernel space
+        let (kernel_stack_bottom, kernel_stack_top) = kernel_stack_position(app_id);
+        KERNEL_SPACE.exclusive_access().insert_framed_area(
+            kernel_stack_bottom.into(),
+            kernel_stack_top.into(),
+            MapPermission::R | MapPermission::W,
+        );
+        let task_control_block = Self {
+            task_status,
+            task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+            memory_set,
+            trap_cx_ppn,
+            base_size: user_sp,
+            heap_bottom: user_sp,
+            program_brk: user_sp,
+
+            syscall_times: [0; MAX_SYSCALL_NUM],
+
+        };
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+    /// change the location of the program break. return None if failed.
+    pub fn change_program_brk(&mut self, size: i32) -> Option<usize> {
+        let old_break = self.program_brk;
+        let new_brk = self.program_brk as isize + size as isize;
+        if new_brk < self.heap_bottom as isize {
+            return None;
+        }
+        let result = if size < 0 {
+            self.memory_set
+                .shrink_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
+        } else {
+            self.memory_set
+                .append_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
+        };
+        if result {
+            self.program_brk = new_brk as usize;
+            Some(old_break)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+/// task status: UnInit, Ready, Running, Exited
+pub enum TaskStatus {
+    /// uninitialized
+    UnInit,
+    /// ready to run
+    Ready,
+    /// running
+    Running,
+    /// exited
+    Exited,
+}
+</file>
+
+<file path="os/src/mm/memory_set.rs">
+//! Implementation of [`MapArea`] and [`MemorySet`].
+
+use super::{frame_alloc, FrameTracker};
+use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
+use super::{StepByOne, VPNRange};
+use crate::config::{
+    KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
+};
+use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::arch::asm;
+use lazy_static::*;
+use riscv::register::satp;
+
+extern "C" {
+    fn stext();
+    fn etext();
+    fn srodata();
+    fn erodata();
+    fn sdata();
+    fn edata();
+    fn sbss_with_stack();
+    fn ebss();
+    fn ekernel();
+    fn strampoline();
+}
+
+lazy_static! {
+    /// The kernel's initial memory mapping(kernel address space)
+    pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> =
+        Arc::new(unsafe { UPSafeCell::new(MemorySet::new_kernel()) });
+}
+/// address space
+pub struct MemorySet {
+    page_table: PageTable,
+    areas: Vec<MapArea>,
+}
+
+impl MemorySet {
+    /// Create a new empty `MemorySet`.
+    pub fn new_bare() -> Self {
+        Self {
+            page_table: PageTable::new(),
+            areas: Vec::new(),
+        }
+    }
+    /// Get the page table token
+    pub fn token(&self) -> usize {
+        self.page_table.token()
+    }
+    /// Assume that no conflicts.
+    pub fn insert_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        self.push(
+            MapArea::new(start_va, end_va, MapType::Framed, permission),
+            None,
+        );
+    }
+    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+        map_area.map(&mut self.page_table);
+        if let Some(data) = data {
+            map_area.copy_data(&mut self.page_table, data);
+        }
+        self.areas.push(map_area);
+    }
+    /// Mention that trampoline is not collected by areas.
+    fn map_trampoline(&mut self) {
+        self.page_table.map(
+            VirtAddr::from(TRAMPOLINE).into(),
+            PhysAddr::from(strampoline as usize).into(),
+            PTEFlags::R | PTEFlags::X,
+        );
+    }
+    /// Without kernel stacks.
+    pub fn new_kernel() -> Self {
+        let mut memory_set = Self::new_bare();
+        // map trampoline
+        memory_set.map_trampoline();
+        // map kernel sections
+        info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
+        info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
+        info!(".data [{:#x}, {:#x})", sdata as usize, edata as usize);
+        info!(
+            ".bss [{:#x}, {:#x})",
+            sbss_with_stack as usize, ebss as usize
+        );
+        info!("mapping .text section");
+        memory_set.push(
+            MapArea::new(
+                (stext as usize).into(),
+                (etext as usize).into(),
+                MapType::Identical,
+                MapPermission::R | MapPermission::X,
+            ),
+            None,
+        );
+        info!("mapping .rodata section");
+        memory_set.push(
+            MapArea::new(
+                (srodata as usize).into(),
+                (erodata as usize).into(),
+                MapType::Identical,
+                MapPermission::R,
+            ),
+            None,
+        );
+        info!("mapping .data section");
+        memory_set.push(
+            MapArea::new(
+                (sdata as usize).into(),
+                (edata as usize).into(),
+                MapType::Identical,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        info!("mapping .bss section");
+        memory_set.push(
+            MapArea::new(
+                (sbss_with_stack as usize).into(),
+                (ebss as usize).into(),
+                MapType::Identical,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        info!("mapping physical memory");
+        memory_set.push(
+            MapArea::new(
+                (ekernel as usize).into(),
+                MEMORY_END.into(),
+                MapType::Identical,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        memory_set
+    }
+    /// Include sections in elf and trampoline and TrapContext and user stack,
+    /// also returns user_sp_base and entry point.
+    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+        let mut memory_set = Self::new_bare();
+        // map trampoline
+        memory_set.map_trampoline();
+        // map program headers of elf, with U flag
+        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let elf_header = elf.header;
+        let magic = elf_header.pt1.magic;
+        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        let ph_count = elf_header.pt2.ph_count();
+        let mut max_end_vpn = VirtPageNum(0);
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
+                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                max_end_vpn = map_area.vpn_range.get_end();
+                memory_set.push(
+                    map_area,
+                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                );
+            }
+        }
+        // map user stack with U flags
+        let max_end_va: VirtAddr = max_end_vpn.into();
+        let mut user_stack_bottom: usize = max_end_va.into();
+        // guard page
+        user_stack_bottom += PAGE_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+        memory_set.push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        );
+        // used in sbrk
+        memory_set.push(
+            MapArea::new(
+                user_stack_top.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        );
+        // map TrapContext
+        memory_set.push(
+            MapArea::new(
+                TRAP_CONTEXT_BASE.into(),
+                TRAMPOLINE.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        (
+            memory_set,
+            user_stack_top,
+            elf.header.pt2.entry_point() as usize,
+        )
+    }
+    /// Change page table by writing satp CSR Register.
+    pub fn activate(&self) {
+        let satp = self.page_table.token();
+        unsafe {
+            satp::write(satp);
+            asm!("sfence.vma");
+        }
+    }
+    /// Translate a virtual page number to a page table entry
+    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        self.page_table.translate(vpn)
+    }
+    /// shrink the area to new_end
+    #[allow(unused)]
+    pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.get_start() == start.floor())
+        {
+            area.shrink_to(&mut self.page_table, new_end.ceil());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// append the area to new_end
+    #[allow(unused)]
+    pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.get_start() == start.floor())
+        {
+            area.append_to(&mut self.page_table, new_end.ceil());
+            true
+        } else {
+            false
+        }
+    }
+
+ 
+    /// 处理 mmap 映射请求
+   pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+    if start % PAGE_SIZE != 0 { return -1; }
+    if port & !0x7 != 0 || port & 0x7 == 0 { return -1; }
+    if len == 0 { return -1; }
+    
+    // 🛡️ 关键防御：限制 MapArea 的数量，防止恶意测试无限 mmap 导致内核堆崩溃
+    if self.areas.len() >= 256 { return -1; }
+
+    let end = start.wrapping_add(len);
+    if end < start { return -1; }
+
+    let start_vpn = VirtAddr::from(start).floor();
+    let end_vpn = VirtAddr::from(end).ceil();
+
+    // 冲突检查：要映射的区间绝不能与已有的任何区间重叠
+    for area in self.areas.iter() {
+        if area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn {
+            return -1; 
+        }
+    }
+
+    let mut map_perm = MapPermission::U;
+    if port & 1 != 0 { map_perm |= MapPermission::R; }
+    if port & 2 != 0 { map_perm |= MapPermission::W; }
+    if port & 4 != 0 { map_perm |= MapPermission::X; }
+
+    self.insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), map_perm);
+    0
+}
+
+/// 处理 munmap 解除映射请求 (支持区间切片、部分解绑版)
+pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 { return -1; }
+    if len == 0 { return -1; }
+    let end = start.wrapping_add(len);
+    if end < start { return -1; }
+
+    let start_vpn = VirtAddr::from(start).floor();
+    let end_vpn = VirtAddr::from(end).ceil();
+
+    let mut found_idx = None;
+    for (idx, area) in self.areas.iter().enumerate() {
+        if area.vpn_range.get_start() <= start_vpn && area.vpn_range.get_end() >= end_vpn {
+            found_idx = Some(idx);
+            break;
+        }
+    }
+
+    if let Some(idx) = found_idx {
+        // 1. 解除这部分的物理内存映射
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            self.areas[idx].unmap_one(&mut self.page_table, vpn);
+        }
+
+        let old_start = self.areas[idx].vpn_range.get_start();
+        let old_end = self.areas[idx].vpn_range.get_end();
+        let map_type = self.areas[idx].map_type;
+        let map_perm = self.areas[idx].map_perm;
+
+        // 2. 如果是完全解绑，直接删掉整个 Area
+        if old_start == start_vpn && old_end == end_vpn {
+            self.areas.remove(idx);
+            return 0;
+        }
+
+        // 3. 如果解绑的是中间部分或前部分，我们需要进行“切片”处理
+        // 处理右半部分：如果解绑区域不到末尾，右边剩下的要单独成块
+        if end_vpn < old_end {
+            let mut right_area = MapArea {
+                vpn_range: VPNRange::new(end_vpn, old_end),
+                data_frames: alloc::collections::BTreeMap::new(),
+                map_type,
+                map_perm,
+            };
+            // 把右半部分的物理页转移到新块里
+            for vpn in VPNRange::new(end_vpn, old_end) {
+                if let Some(frame) = self.areas[idx].data_frames.remove(&vpn) {
+                    right_area.data_frames.insert(vpn, frame);
+                }
+            }
+            self.areas.push(right_area);
+        }
+
+        // 处理左半部分：如果解绑区域不从开头开始，左边剩下的保留
+        if old_start < start_vpn {
+            self.areas[idx].vpn_range = VPNRange::new(old_start, start_vpn);
+        } else {
+            // 如果是从头开始解绑的，原本的头部 Area 就可以丢弃了
+            self.areas.remove(idx);
+        }
+
+        return 0;
+    }
+    -1
+}
+ 
+}
+
+
+/// map area structure, controls a contiguous piece of virtual memory
+pub struct MapArea {
+    vpn_range: VPNRange,
+    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    map_type: MapType,
+    map_perm: MapPermission,
+}
+
+impl MapArea {
+    pub fn new(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_type: MapType,
+        map_perm: MapPermission,
+    ) -> Self {
+        let start_vpn: VirtPageNum = start_va.floor();
+        let end_vpn: VirtPageNum = end_va.ceil();
+        Self {
+            vpn_range: VPNRange::new(start_vpn, end_vpn),
+            data_frames: BTreeMap::new(),
+            map_type,
+            map_perm,
+        }
+    }
+    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        let ppn: PhysPageNum;
+        match self.map_type {
+            MapType::Identical => {
+                ppn = PhysPageNum(vpn.0);
+            }
+            MapType::Framed => {
+                let frame = frame_alloc().unwrap();
+                ppn = frame.ppn;
+                self.data_frames.insert(vpn, frame);
+            }
+        }
+        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        page_table.map(vpn, ppn, pte_flags);
+    }
+    #[allow(unused)]
+    pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        if self.map_type == MapType::Framed {
+            self.data_frames.remove(&vpn);
+        }
+        page_table.unmap(vpn);
+    }
+    pub fn map(&mut self, page_table: &mut PageTable) {
+        for vpn in self.vpn_range {
+            self.map_one(page_table, vpn);
+        }
+    }
+    #[allow(unused)]
+    pub fn unmap(&mut self, page_table: &mut PageTable) {
+        for vpn in self.vpn_range {
+            self.unmap_one(page_table, vpn);
+        }
+    }
+    #[allow(unused)]
+    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
+            self.unmap_one(page_table, vpn)
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+    #[allow(unused)]
+    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+        for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
+            self.map_one(page_table, vpn)
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+    /// data: start-aligned but maybe with shorter length
+    /// assume that all frames were cleared before
+    pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {
+        assert_eq!(self.map_type, MapType::Framed);
+        let mut start: usize = 0;
+        let mut current_vpn = self.vpn_range.get_start();
+        let len = data.len();
+        loop {
+            let src = &data[start..len.min(start + PAGE_SIZE)];
+            let dst = &mut page_table
+                .translate(current_vpn)
+                .unwrap()
+                .ppn()
+                .get_bytes_array()[..src.len()];
+            dst.copy_from_slice(src);
+            start += PAGE_SIZE;
+            if start >= len {
+                break;
+            }
+            current_vpn.step();
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+/// map type for memory set: identical or framed
+pub enum MapType {
+    Identical,
+    Framed,
+}
+
+bitflags! {
+    /// map permission corresponding to that in pte: `R W X U`
+    pub struct MapPermission: u8 {
+        ///Readable
+        const R = 1 << 1;
+        ///Writable
+        const W = 1 << 2;
+        ///Excutable
+        const X = 1 << 3;
+        ///Accessible in U mode
+        const U = 1 << 4;
+    }
+}
+
+/// Return (bottom, top) of a kernel stack in kernel space.
+pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
+    let top = TRAMPOLINE - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
+    let bottom = top - KERNEL_STACK_SIZE;
+    (bottom, top)
+}
+
+/// remap test in kernel space
+#[allow(unused)]
+pub fn remap_test() {
+    let mut kernel_space = KERNEL_SPACE.exclusive_access();
+    let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
+    let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
+    let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_text.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_rodata.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_data.floor())
+        .unwrap()
+        .executable(),);
+    println!("remap_test passed!");
+}
+</file>
+
+<file path=".github/workflows/build.yml">
+name: Jobs
+
+on: [push]
+
+env:
+  CARGO_TERM_COLOR: always
+  rust_toolchain: nightly
+
+jobs:
+  build-doc:
+    if: github.repository == 'LearningOS/rCore-Tutorial-Code'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build doc
+        run: |
+          git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
+          cd os
+          make
+          cargo doc --no-deps --verbose
+      - name: Push to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./os/target/riscv64gc-unknown-none-elf/doc
+          destination_dir: ${{ github.ref_name }}
+  basic-test:
+    runs-on: ubuntu-latest
+    outputs:
+      points: ${{ steps.end.outputs.points }}
+    container:
+      image: alicesama/rcore-ci:2024a
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: |
+          qemu-system-riscv64 --version
+          rustup target add riscv64gc-unknown-none-elf
+          git config --global --add safe.directory /__w/${{ github.event.repository.name }}/${{ github.event.repository.name }}
+          git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
+          git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
+          ID=`git rev-parse --abbrev-ref HEAD | grep -oP 'ch\K[0-9]'`
+          cd ci-user
+          make test CHAPTER=$ID | tee ../output.txt
+      - name: end
+        id: end
+        run: grep -a "Test passed" output.txt | grep -oP "\d{1,}/\d{1,}" | xargs -i echo "points={}" | tee $GITHUB_OUTPUT
+      - name: Require full points
+        run: |
+          POINTS='${{ steps.end.outputs.points }}'
+          if [ -z "$POINTS" ]; then
+            echo "points is empty"
+            exit 1
+          fi
+          GOT="${POINTS%%/*}"
+          TOTAL="${POINTS##*/}"
+          if [ "$GOT" != "$TOTAL" ]; then
+            echo "points is not full score: $POINTS"
+            exit 1
+          fi
+          echo "points is full score: $POINTS"
+  deploy:
+    if: github.repository != 'LearningOS/rCore-Tutorial-Code'
+    name: Deploy to pages
+    needs: basic-test
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - uses: actions/checkout@v3
+        continue-on-error: true
+        with:
+          ref: gh-pages
+      - name: Save Log File
+        uses: yfblock/multi-rank-log@main
+        with:
+          public-dir: classroom
+          points: ${{ needs.basic-test.outputs.points }}
+      - name: GitHub Pages
+        uses: crazy-max/ghaction-github-pages@v3
+        with:
+          target_branch: gh-pages
+          build_dir: ./classroom
+          keep_history: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload score
+        run: |
+          cat classroom/latest.json
+          score=$(( $(grep -o 'ch' classroom/latest.json | wc -l) * 100))
+          echo $score
+
+          score_json=$(jq -n \
+            --arg channel github \
+            --argjson courseId ${{ secrets.RCORE_2026_SPRING_COURSE_ID }} \
+            --arg name ${{ github.actor }} \
+            --argjson score $score \
+            --argjson totalScore 500 \
+            '{channel: $channel, courseId: $courseId, name: $name, score: $score, totalScore: $totalScore}')
+
+          response=$(curl -X POST ${{ secrets.COURSE_POST_API }} \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.RCORE_2026_SPRING_TOKEN }}" \
+            -d "$score_json" \
+            -v)
+
+          echo "Response: $response"
+
+          if echo "$response" | grep -q '"result":1'; then
+            echo "Success: The result field contains 1."
+          else
+            echo "Error: The result field does not contain 1."
+            exit 1
+          fi
+</file>
+
+<file path="README.md">
+# rCore-Tutorial-Code
+
+## Code
+
+- [Soure Code of labs](https://github.com/LearningOS/rCore-Tutorial-Code)
+
+## Documents
+
+- Concise Manual: [rCore-Tutorial-Guide](https://LearningOS.github.io/rCore-Tutorial-Guide/)
+
+- Detail Book [rCore-Tutorial-Book-v3](https://rcore-os.github.io/rCore-Tutorial-Book-v3/)
+
+## OS API docs of rCore Tutorial Code
+
+- [OS API docs of ch1](https://learningos.github.io/rCore-Tutorial-Code/ch1/os/index.html)
+  AND [OS API docs of ch2](https://learningos.github.io/rCore-Tutorial-Code/ch2/os/index.html)
+- [OS API docs of ch3](https://learningos.github.io/rCore-Tutorial-Code/ch3/os/index.html)
+  AND [OS API docs of ch4](https://learningos.github.io/rCore-Tutorial-Code/ch4/os/index.html)
+- [OS API docs of ch5](https://learningos.github.io/rCore-Tutorial-Code/ch5/os/index.html)
+  AND [OS API docs of ch6](https://learningos.github.io/rCore-Tutorial-Code/ch6/os/index.html)
+- [OS API docs of ch7](https://learningos.github.io/rCore-Tutorial-Code/ch7/os/index.html)
+  AND [OS API docs of ch8](https://learningos.github.io/rCore-Tutorial-Code/ch8/os/index.html)
+- [OS API docs of ch9](https://learningos.github.io/rCore-Tutorial-Code/ch9/os/index.html)
+
+## Related Resources
+
+- [Learning Resource](https://github.com/LearningOS/rust-based-os-comp2025/blob/main/relatedinfo.md)
+
+## Setup
+
+```bash
+$ git clone https://github.com/LearningOS/2026s-rcore-[YOUR_USER_NAME].git
+$ cd 2026s-rcore-[YOUR_USER_NAME]
+```
+
+## Build & Run
+
+```bash
+# setup build&run environment first
+$ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
+$ git checkout ch$ID
+$ cd os
+# run OS in ch$ID
+$ make run
+```
+
+If you want to use docker to build and run, you can use the following command:
+```bash
+# After clone the `rCore-Tutorial-Test` repository to your local machine, you can use the following command to build and run:
+$ make build_docker
+$ make docker
+```
+
+If you experience network issues when accessing foreign resources such as GitHub in Docker, you can follow the following suggestions according to your stage:
+
+- Docker pull:
+  1. use proxy: https://docs.docker.com/reference/cli/docker/image/pull/#proxy-configuration
+
+  2. use available domestic source (self-search)
+
+- Docker build: use proxy https://docs.docker.com/engine/cli/proxy/#build-with-a-proxy-configuration
+
+- Docker run: use proxy option, related operations are similar to `Docker build`, can refer to the relevant materials by yourself
+
+
+Notice: $ID is from [1-9]
+
+## Grading
+
+```bash
+# setup build&run environment first
+$ rm -rf ci-user
+$ git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
+$ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
+$ git checkout ch$ID
+# check&grade OS in ch$ID with more tests
+$ cd ci-user && make test CHAPTER=$ID
+```
+
+Notice: $ID is from [3,4,5,6,8]
+</file>
+
+</files>
