@@ -43,6 +43,46 @@ pub struct MemorySet {
 }
 
 impl MemorySet {
+
+///
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        if start % crate::config::PAGE_SIZE != 0 || port & !0x7 != 0 || port & 0x7 == 0 { return -1; }
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let mut map_perm = MapPermission::U;
+        if (port & 1) != 0 { map_perm |= MapPermission::R; }
+        if (port & 2) != 0 { map_perm |= MapPermission::W; }
+        if (port & 4) != 0 { map_perm |= MapPermission::X; }
+        
+        for area in self.areas.iter() {
+            if start_va.floor() < area.vpn_range.get_end() && end_va.ceil() > area.vpn_range.get_start() {
+                return -1;
+            }
+        }
+        self.insert_framed_area(start_va, end_va, map_perm);
+        0
+    }
+///
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        if start % crate::config::PAGE_SIZE != 0 { return -1; }
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        
+        let mut found = false;
+        for area in self.areas.iter() {
+            if area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.ceil() {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            self.remove_area_with_start_vpn(start_va.floor());
+            0
+        } else { -1 }
+    }
+
+
+
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
         Self {

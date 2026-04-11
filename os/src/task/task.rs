@@ -36,6 +36,69 @@ impl TaskControlBlock {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
+
+
+    /// Spawn a new process from the given ELF data
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(crate::config::TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+
+        let pid_handle = crate::task::id::pid_alloc();
+        let kernel_stack = crate::task::id::kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+
+        // 获取父进程的锁（声明为 mut 以便后续 push child）
+        let mut parent_inner = self.inner_exclusive_access();
+        
+        let mut new_fd_table: alloc::vec::Vec<Option<Arc<dyn crate::fs::File + Send + Sync>>> = alloc::vec::Vec::new();
+        for fd in parent_inner.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                crate::sync::UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: crate::task::TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: crate::task::TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: alloc::vec::Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                })
+            },
+        });
+
+        // 核心修复点：将新创建的子进程加入到父进程的孩子列表中！
+        parent_inner.children.push(task_control_block.clone());
+        
+        // 释放父进程的锁，避免后续操作发生死锁
+        drop(parent_inner);
+
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = crate::trap::TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            crate::mm::KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            crate::trap::trap_handler as usize,
+        );
+        
+        task_control_block
+    }
 }
 
 pub struct TaskControlBlockInner {

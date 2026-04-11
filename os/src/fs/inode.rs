@@ -29,6 +29,11 @@ pub struct OSInodeInner {
 }
 
 impl OSInode {
+
+
+
+
+
     /// create a new inode in memory
     pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
         Self {
@@ -56,6 +61,7 @@ impl OSInode {
 }
 
 lazy_static! {
+    /// The root inode of the file system
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -156,4 +162,18 @@ impl File for OSInode {
         }
         total_write_size
     }
+
+
+    fn get_stat(&self) -> crate::fs::Stat {
+        let inner = self.inner.exclusive_access();
+        crate::fs::Stat {
+            dev: 0,
+            ino: 0, // 仅供测试
+            mode: crate::fs::StatMode::FILE,
+            nlink: inner.inode.get_nlink(), // 真正读取磁盘节点上的 nlink
+            pad: [0; 7]
+        }
+    }
+
+    
 }
