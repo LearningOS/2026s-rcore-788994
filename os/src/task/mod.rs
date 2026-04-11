@@ -12,7 +12,8 @@
 mod context;
 mod id;
 mod manager;
-mod process;
+///
+pub mod process;
 mod processor;
 mod signal;
 mod switch;
@@ -26,7 +27,9 @@ use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+
+///
+pub use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use context::TaskContext;
@@ -87,6 +90,46 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
+
+
+    // ++++ 新增：线程退出时，自动释放其持有的所有 Mutex 和 Semaphore ++++
+    let mut process_inner = process.inner_exclusive_access();
+
+
+    if tid < process_inner.thread_wait_mutex.len() {
+        process_inner.thread_wait_mutex[tid] = None;
+        //process_inner.thread_wait_sem[tid] = None;
+    }
+
+    if tid < process_inner.thread_wait_sem.len() {
+        process_inner.thread_wait_sem[tid] = None;
+    }
+
+
+    for i in 0..process_inner.mutex_owner.len() {
+        if process_inner.mutex_owner[i] == Some(tid) {
+            process_inner.mutex_owner[i] = None;
+            if let Some(mutex) = process_inner.mutex_list[i].clone() {
+                drop(process_inner);
+                mutex.unlock();
+                process_inner = process.inner_exclusive_access();
+            }
+        }
+    }
+    for i in 0..process_inner.sem_allocated.len() {
+        if let Some(count) = process_inner.sem_allocated[i].remove(&tid) {
+            if let Some(sem) = process_inner.semaphore_list[i].clone() {
+                drop(process_inner);
+                for _ in 0..count {
+                    sem.up();
+                }
+                process_inner = process.inner_exclusive_access();
+            }
+        }
+    }
+    drop(process_inner);
+
+
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {
@@ -173,7 +216,7 @@ lazy_static! {
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("ch8b_initproc", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("ch8b_initproc", OpenFlags::RDONLY).expect("Can't find ch8b_initproc");
         let v = inode.read_all();
         ProcessControlBlock::new(v.as_slice())
     };

@@ -3,7 +3,7 @@ use crate::{
     mm::{translated_ref, translated_refmut, translated_str},
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-        suspend_current_and_run_next, SignalFlags,
+        suspend_current_and_run_next, SignalFlags,ProcessControlBlock,
     },
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -151,12 +151,15 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+// 修改 os/src/syscall/process.rs 中的 sys_get_time
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let task = current_task().unwrap();
+    let token = task.get_user_token();
+    let ticks = crate::timer::get_time();
+    let sec = ticks / crate::config::CLOCK_FREQ;
+    let usec = (ticks % crate::config::CLOCK_FREQ) * 1000000 / crate::config::CLOCK_FREQ;
+    *translated_refmut(token, ts) = TimeVal { sec, usec };
+    0
 }
 
 /// mmap syscall
@@ -193,14 +196,26 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// spawn syscall
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        
+        let current_proc = current_process();
+        let deadlock_detect = current_proc.inner_exclusive_access().is_deadlock_detect;
+        
+        let new_process = ProcessControlBlock::new(all_data.as_slice());
+        new_process.inner_exclusive_access().is_deadlock_detect = deadlock_detect;
+        
+        let new_pid = new_process.getpid();
+        let mut inner = current_proc.inner_exclusive_access();
+        inner.children.push(new_process);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
-
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority

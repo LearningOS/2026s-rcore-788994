@@ -5,7 +5,7 @@
 //! NOTICE: The difference between [`Inode`] and [`DiskInode`]  can be seen from their names: DiskInode in a relatively fixed location within the disk block, while Inode Is a data structure placed in memory that records file inode information.
 use super::{
     block_cache_sync_all, get_block_cache, BlockDevice, DirEntry, DiskInode, DiskInodeType,
-    EasyFileSystem, DIRENT_SZ,
+    EasyFileSystem, DIRENT_SZ,BLOCK_SZ,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -197,4 +197,68 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+
+
+    /// 获取当前 Inode 的 ID
+    pub fn get_inode_id(&self) -> u32 {
+        let fs = self.fs.lock();
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+        // 反向计算 ID
+        (self.block_id as u32 - fs.inode_area_start_block) * inodes_per_block
+            + (self.block_offset / inode_size) as u32
+    }
+
+    pub fn link(&self, name: &str, new_inode: &Arc<Inode>) -> isize {
+        let mut fs = self.fs.lock();
+        self.modify_disk_inode(|root_inode| {
+            // 确保是目录
+            assert!(root_inode.is_dir());
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // 扩容目录文件以容纳新目录项
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            // 关键：获取目标 Inode 的 ID
+            let target_iid = new_inode.get_inode_id();
+            let dirent = DirEntry::new(name, target_iid);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        block_cache_sync_all();
+        0
+    }
+
+    pub fn unlink(&self, name: &str) -> isize {
+        let mut _fs = self.fs.lock(); // 加锁防止竞争
+        self.modify_disk_inode(|root_inode| {
+            assert!(root_inode.is_dir());
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let mut index = None;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                if dirent.name() == name {
+                    index = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = index {
+                // 将最后一个目录项覆盖到当前位置，缩减 size
+                let last_dirent_offset = (file_count - 1) * DIRENT_SZ;
+                let mut last_dirent = DirEntry::empty();
+                root_inode.read_at(last_dirent_offset, last_dirent.as_bytes_mut(), &self.block_device);
+                root_inode.write_at(i * DIRENT_SZ, last_dirent.as_bytes(), &self.block_device);
+                root_inode.size -= DIRENT_SZ as u32;
+                0
+            } else {
+                -1
+            }
+        });
+        block_cache_sync_all();
+        0
+    }
+    
 }

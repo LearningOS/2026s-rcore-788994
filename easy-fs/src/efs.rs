@@ -20,9 +20,9 @@ pub struct EasyFileSystem {
     /// The bitmap of data blocks
     pub data_bitmap: Bitmap,
     /// The start block id of inode area
-    inode_area_start_block: u32,
+    pub inode_area_start_block: u32,
     /// The start block id of data area
-    data_area_start_block: u32,
+    pub data_area_start_block: u32,
 }
 
 type DataBlock = [u8; BLOCK_SZ];
